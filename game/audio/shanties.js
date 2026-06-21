@@ -38,10 +38,10 @@
 const A = {
   blow:    ['blow-the-man-down', '01 - Blow the Man Down - Leonard Warren - Tom Scott'],
   rio:     ['rio-grande', '02 - Rio Grande - Leonard Warren - Tom Scott - Morris Levine'],
-  drummer: ['drummer-and-cook', '03 - The Drummer and the Cook - Leonard Warren - Tom Scott'],
+  drummer: ['drummer-and-cook', '03 - The Drummer and the Cook - Leonard Warren'],
   shen:    ['shenandoah', '04 - Shenandoah - Leonard Warren - Tom Scott - Morris Levine'],
   haul:    ['haul-away-joe', '05 - Haul-A-Way, Joe - Leonard Warren - Tom Scott'],
-  lowlands:['low-lands', '06 - Low Lands - Leonard Warren - Tom Scott'],
+  lowlands:['low-lands', '06 - Low Lands - Leonard Warren - Tom Scott - Morris Levine'],
   drunk:   ['drunken-sailor', '07 - The Drunken Sailor - Leonard Warren - Tom Scott'],
   rove:    ["a-roving", "08 - A-Rovin' - Leonard Warren - Tom Scott - Morris Levine"],
 };
