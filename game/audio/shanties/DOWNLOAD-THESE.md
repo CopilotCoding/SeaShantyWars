@@ -1,6 +1,5 @@
 # Real public-domain shanties — download & drop in here
 
-I can't download binary audio into the project, but here are the direct URLs.
 **Right-click → Save As** each link into THIS folder (`game/audio/shanties/`).
 
 **Auto-load:** you no longer have to match a name list. Anything you drop in here
