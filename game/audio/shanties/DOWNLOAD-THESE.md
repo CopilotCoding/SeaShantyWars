@@ -1,7 +1,6 @@
 # Real public-domain shanties — download & drop in here
 
-I can't download binary files into the project from this environment, but I found
-the direct URLs. **Right-click → Save As** each link into THIS folder
+**Right-click → Save As** each link into THIS folder
 (`game/audio/shanties/`) using the **target filename** shown. The game auto-loads
 them on next reload (console logs each one).
 
