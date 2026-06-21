@@ -3,6 +3,7 @@ import { VoxelShip as Ship } from './ship/voxelShip.js';
 import { ShipAI } from './ai.js';
 import { rollLoot } from './crews.js';
 import { CrewParty } from './crew/crewParty.js';
+import { SHIP_SPECS } from './ship/hull.js';
 
 // A LIVING SEA: spawns and maintains a handful of enemy ships of varied crew
 // types around the ocean, each with its own AI, all registered as combat
@@ -14,20 +15,23 @@ const SHIP_NAMES = [
   'The Gilded Maw', 'The Bonny Lass', 'The Tempest', 'The Drowned Crown',
   'The Iron Tide', 'The Rogue’s Wager', 'The Pale Albatross', 'The Stormcrow',
 ];
+// Which hull classes each faction can sail, ordered weakest -> strongest. The
+// fleet picks from a window of this list based on the player's current ship tier
+// (see _pickSpec), so as you upgrade, tougher variants of each faction appear.
 const SPEC_BY_CREW = {
-  civilian: ['sloop'],
-  merchant: ['sloop', 'brig'],   // mostly small traders; brig occasionally
-  pirate:   ['sloop', 'brig'],
-  military: ['brig'],            // navy = the tough fight, but not a galleon spam
+  civilian: ['cutter', 'sloop', 'schooner'],
+  merchant: ['sloop', 'schooner', 'brig', 'frigate', 'galleon'],
+  // Pirates field a full range INCLUDING heavy hulls (a dread pirate galleon /
+  // man-o-war) so they can stand up to the navy.
+  pirate:   ['cutter', 'sloop', 'schooner', 'brig', 'frigate', 'galleon', 'manowar'],
+  military: ['schooner', 'brig', 'frigate', 'galleon', 'manowar'],
 };
-// Weighted crew pool: a WARRING sea — mostly pirates (raid everyone) and navy
-// (hunt the pirates), with a minority of civilian/merchant prey to plunder. This
-// keeps NPC-vs-NPC battles constant. Galleons only show as the occasional rare
-// big-score (see _spawnOne).
+// Weighted crew pool: a WARRING sea. PIRATES are the most common (they rule these
+// waters), navy hunts them, with a minority of civilian/merchant prey to plunder.
 const CREW_POOL = [
-  'civilian', 'merchant', 'merchant',           // some prey to hunt/plunder
-  'pirate', 'pirate', 'pirate',                 // lots of raiders (attack everyone)
-  'military', 'military', 'military',            // strong navy presence to fight them
+  'civilian', 'merchant', 'merchant',                       // some prey
+  'pirate', 'pirate', 'pirate', 'pirate', 'pirate',         // pirates dominate the sea
+  'military', 'military', 'military',                       // navy hunting them
 ];
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -58,15 +62,45 @@ export class Fleet {
     return name;
   }
 
+  // The player's current ship tier (0..6), used to scale enemy strength.
+  _playerTier() {
+    const s = this.playerShip;
+    const spec = s && s.spec;
+    return spec && spec.tier != null ? spec.tier : 1;
+  }
+
+  // Pick a hull for a faction, biased toward the PLAYER's tier so enemies scale
+  // with the player's ship. We aim a target tier a touch ABOVE the player's
+  // (so there's always a step-up to fight for), then pick the class in the
+  // faction's list whose tier is nearest a randomized target — giving a spread
+  // around the current difficulty rather than always the exact same hull.
+  _pickSpec(crew) {
+    const list = SPEC_BY_CREW[crew] || ['brig'];
+    const pt = this._playerTier();
+    // Target tier: around the player's, leaning slightly higher, with spread.
+    const target = pt + 0.5 + (Math.random() * 2 - 1) * 1.6; // ±~1.6 tiers
+    let best = list[0], bestD = Infinity;
+    for (const key of list) {
+      const t = SHIP_SPECS[key] ? SHIP_SPECS[key].tier : 3;
+      const d = Math.abs(t - target);
+      if (d < bestD) { bestD = d; best = key; }
+    }
+    return best;
+  }
+
   // Spawn one enemy ship in open water, at a safe distance from the player.
   _spawnOne() {
     if (this.ships.length >= this.maxShips) return;
     const dir = this._spawnDir();
     if (!dir) return;
     const crew = pick(CREW_POOL);
-    // 10% chance a merchant/navy is a fat GALLEON (a rare risky big-score).
-    let specKey = pick(SPEC_BY_CREW[crew] || ['brig']);
-    if ((crew === 'merchant' || crew === 'military') && Math.random() < 0.1) specKey = 'galleon';
+    // Pick a hull scaled to the player's current ship tier (stronger player =>
+    // stronger enemies). A rare chance any merchant/navy fields their heaviest.
+    let specKey = this._pickSpec(crew);
+    if ((crew === 'merchant' || crew === 'military') && Math.random() < 0.12) {
+      const list = SPEC_BY_CREW[crew];
+      specKey = list[list.length - 1]; // their top-of-line (galleon / man-o-war)
+    }
     // Sail color: pirates black, navy navy-blue, merchant warm, civilian pale.
     const sailColor = { pirate: 0x222226, military: 0x2b3a5a, merchant: 0x6a5a36, civilian: 0xb8b29a }[crew] || 0x2b2b2b;
     const ship = new Ship(this.scene, this.ocean, specKey, dir, this.planet, {
@@ -117,10 +151,26 @@ export class Fleet {
     if (p) { p.dispose(); this.parties.delete(ship); }
   }
 
+  // Fully remove a ship from the world: its meshes, combat target, AI and crew.
+  _removeShip(s) {
+    if (s.mesh) this.scene.remove(s.mesh);
+    if (s.chestMesh) this.scene.remove(s.chestMesh);
+    if (s.wheelMesh) this.scene.remove(s.wheelMesh);
+    if (s.factionFlag) this.scene.remove(s.factionFlag);
+    if (s._debris) for (const d of s._debris) if (d.mesh) this.scene.remove(d.mesh);
+    this.combat.targets = this.combat.targets.filter(t => t !== s);
+    this.ais.delete(s);
+    this._disposeParty(s);
+  }
+
   // Every ship in the world the AI should consider (player + fleet).
   _allShips() {
+    // Enemy fleet + ALL of the player's ships (current hull + any captured/owned
+    // ones), so the AI sees and engages whichever vessel you're actually sailing
+    // after a ship swap — and treats your captured prizes as hostile too.
     const out = this.ships.slice();
-    out.push(this.playerShip);
+    if (this.playerShip && !out.includes(this.playerShip)) out.push(this.playerShip);
+    for (const o of this.owned) if (!out.includes(o)) out.push(o);
     return out;
   }
 
@@ -205,15 +255,19 @@ export class Fleet {
         this.owned.push(s);          // ...but stays in combat.targets (still hittable)
         continue;
       }
-      const gone = (s.sunk && s._removed) || (s.looted && s.surrendered &&
-        s.position.clone().sub(this.playerShip.position).length() > 120);
+      // WRECK CLEANUP: a useless wreck — a DISABLED (dismasted / sailless) hull
+      // that's NEITHER captured NOR under tow — counts down a 60s scuttle timer,
+      // then despawns so dead hulks don't litter the sea. A merely SURRENDERED but
+      // still-seaworthy ship is a valid prize and is left alone (not a wreck). A
+      // fully-sunk husk is removed the moment its sink animation finishes.
+      // disabled-but-NOT-surrendered = a dismasted/sailless derelict (a true
+      // wreck). surrendered ships are also `disabled` but are valid prizes, so we
+      // exclude them.
+      const isWreck = !s.captured && !s._towed && s.disabled && !s.surrendered;
+      if (isWreck) s._wreckT = (s._wreckT || 0) + dt; else s._wreckT = 0;
+      const gone = (s.sunk && s._removed) || (isWreck && s._wreckT > 60);
       if (gone) {
-        if (s.sunk && s._removed && s.mesh) this.scene.remove(s.mesh);
-        if (s.chestMesh) this.scene.remove(s.chestMesh);
-        if (s.wheelMesh) this.scene.remove(s.wheelMesh);
-        this.combat.targets = this.combat.targets.filter(t => t !== s);
-        this.ais.delete(s);
-        this._disposeParty(s);
+        this._removeShip(s);
         this.ships.splice(i, 1);
       }
     }
@@ -222,10 +276,7 @@ export class Fleet {
     for (let i = this.owned.length - 1; i >= 0; i--) {
       const s = this.owned[i];
       if (s.sunk && s._removed) {
-        if (s.mesh) this.scene.remove(s.mesh);
-        if (s.chestMesh) this.scene.remove(s.chestMesh);
-        if (s.wheelMesh) this.scene.remove(s.wheelMesh);
-        this.combat.targets = this.combat.targets.filter(t => t !== s);
+        this._removeShip(s);
         this.owned.splice(i, 1);
       }
     }
@@ -260,11 +311,11 @@ export class Fleet {
       for (let b = a + 1; b < all.length; b++) {
         const A = all[a], B = all[b];
         if (A.sunk || B.sunk) continue;
-        // A freshly-hitched tow is SETTLING into position behind the tug — its
-        // collision is briefly suppressed (`_towSettle` counts down in main) so
-        // the tow line doesn't shove the ship pulling it. Once settled, collision
-        // is back ON (you can't ram a towed prize through others).
-        if (A._towSettle > 0 || B._towSettle > 0) continue;
+        // TOWED ships never collide with anything (they're deliberately tethered
+        // close behind the tug and positioned by updateTow). Letting them collide
+        // would have the trailing prize bump and STALL the ship pulling it — which
+        // read as "can't move while towing". They simply trail along instead.
+        if (A._towed || B._towed) continue;
         // Each ship's keel segment endpoints (bow & stern) in world space.
         const a0 = A.position.clone().addScaledVector(A.forward,  halfLen(A));
         const a1 = A.position.clone().addScaledVector(A.forward, -halfLen(A));

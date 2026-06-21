@@ -18,17 +18,29 @@ export class CrewParty {
   }
 
   _spawn() {
-    const { melee, ranged } = crewComplement(this.ship.crewType);
+    const { melee, ranged } = crewComplement(this.ship.crewType, this.ship.spec);
     const beam = this.ship.spec.beam, length = this.ship.spec.length;
     // Scatter crew across the deck: ranged toward the stern/rails, melee forward
     // (so they rush boarders). A simple jittered grid keeps them spread out.
-    const place = (kind, biasZ) => {
+    const place = (kind, biasZ, captain = false) => {
       const x = (Math.random() * 2 - 1) * (beam * 0.32);
       const z = biasZ + (Math.random() * 2 - 1) * (length * 0.18);
-      this.members.push(new CrewMember(this.scene, this.ship, { x, z }, kind, this.ship.crewType));
+      const m = new CrewMember(this.scene, this.ship, { x, z }, kind, this.ship.crewType, captain);
+      this.members.push(m);
+      if (captain) this.captain = m;
+      return m;
     };
-    for (let i = 0; i < melee; i++)  place('melee',  length * 0.08);
-    for (let i = 0; i < ranged; i++) place('ranged', -length * 0.22);
+    // The CAPTAIN — a distinctive plumed figure, posted near the helm (aft). Every
+    // crewed ship has exactly one; he takes ONE of the melee slots (so the total
+    // matches the complement). A derelict with 0 crew has no captain.
+    let meleeHands = melee;
+    if (melee + ranged > 0) {
+      place('melee', -length * 0.28, true); // captain stands by the wheel
+      if (meleeHands > 0) meleeHands--;       // captain fills a melee slot
+    }
+    // Regular hands.
+    for (let i = 0; i < meleeHands; i++) place('melee',  length * 0.08);
+    for (let i = 0; i < ranged; i++)     place('ranged', -length * 0.22);
   }
 
   // True if no defender is left standing.

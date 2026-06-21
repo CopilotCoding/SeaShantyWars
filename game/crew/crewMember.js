@@ -17,18 +17,20 @@ const MOVE_SPEED = 2.6;      // deck shuffle speed
 export class CrewMember {
   // ship: the VoxelShip this crew defends. localXZ: spawn spot on the deck
   // (deck-local x,z). kind: 'melee' | 'ranged'. crewType: faction (for color).
-  constructor(scene, ship, localXZ, kind, crewType) {
+  constructor(scene, ship, localXZ, kind, crewType, captain = false) {
     this.scene = scene;
     this.ship = ship;
     this.kind = kind;
     this.crewType = crewType;
-    this.hp = kind === 'ranged' ? 24 : 34; // melee tankier; muskets squishier
+    this.captain = captain;
+    // Captains are the toughest hands aboard — markedly more hp than regular crew.
+    this.hp = captain ? 80 : (kind === 'ranged' ? 24 : 34);
     this.dead = false;
     this._attackCd = 0;
     this._swing = 0;       // melee swing animation phase (1 -> 0)
     this._localXZ = { x: localXZ.x, z: localXZ.z }; // current deck-local foot spot
 
-    this.mesh = buildCrewMesh(scene.device, crewType, kind);
+    this.mesh = buildCrewMesh(scene.device, crewType, kind, captain);
     scene.add(this.mesh);
     this.position = new Vec3();   // world feet position (updated each frame)
     this._worldFromLocal();
@@ -93,16 +95,31 @@ export class CrewMember {
           this._meleeSwing(player, ctx);
         }
       } else {
-        // Ranged: keep ~standoff; back off if too close, sidle if too far.
-        if (distToPlayer < RANGED_STANDOFF * 0.7) {
-          const inv = MOVE_SPEED * dt / (distToPlayer || 1);
-          tx -= dx * inv; tz -= dz * inv; // back away
-        } else if (distToPlayer > RANGED_STANDOFF * 1.4) {
-          const inv = MOVE_SPEED * 0.7 * dt / (distToPlayer || 1);
-          tx += dx * inv; tz += dz * inv; // close a bit
-        }
-        if (this._attackCd <= 0 && distToPlayer < RANGED_STANDOFF * 2) {
-          this._musketFire(player, ctx);
+        // Ranged: get ONE musket shot off, then DRAW STEEL — a muzzle-loader takes
+        // an age to reload, so after firing they switch to the cutlass and charge.
+        if (this._firedMusket) {
+          // Now a swordsman: close and swing (same as melee crew).
+          if (this._stagger > 0) {
+            // recovering
+          } else if (distToPlayer > MELEE_RANGE * 0.7) {
+            const inv = MOVE_SPEED * dt / (distToPlayer || 1);
+            tx += dx * inv; tz += dz * inv;
+          } else if (this._attackCd <= 0) {
+            this._meleeSwing(player, ctx);
+          }
+        } else {
+          // Hold standoff until they get their one shot off.
+          if (distToPlayer < RANGED_STANDOFF * 0.7) {
+            const inv = MOVE_SPEED * dt / (distToPlayer || 1);
+            tx -= dx * inv; tz -= dz * inv;
+          } else if (distToPlayer > RANGED_STANDOFF * 1.4) {
+            const inv = MOVE_SPEED * 0.7 * dt / (distToPlayer || 1);
+            tx += dx * inv; tz += dz * inv;
+          }
+          if (this._attackCd <= 0 && distToPlayer < RANGED_STANDOFF * 2) {
+            this._musketFire(player, ctx);
+            this._firedMusket = true; // spent — draw the cutlass from here on
+          }
         }
       }
       // Face the player.

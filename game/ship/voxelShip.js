@@ -4,7 +4,7 @@ import {
 import { SEA_LEVEL } from '../constants.js';
 import { sampleOceanHeight } from '../ocean.js';
 import { SHIP_SPECS } from './hull.js';
-import { buildChestMesh, openChestMesh, buildHelmWheel } from '../loot.js';
+import { buildChestMesh, openChestMesh, buildHelmWheel, buildFactionFlag } from '../loot.js';
 
 // FULLY-VOXEL ship. The ship is a 3D grid of cube voxels in SHIP-LOCAL space,
 // transformed as a rigid body (position + quaternion). A cannonball carves a
@@ -17,12 +17,21 @@ import { buildChestMesh, openChestMesh, buildHelmWheel } from '../loot.js';
 
 const VS = 0.6; // voxel size (world units per cell)
 const GRAVITY_DEBRIS = 14; // fall accel for toppled mast debris
+const HP_PER_VOXEL = 0.85; // ship maxHp = (original hull voxels) * this
+// Hull integrity thresholds (fraction of original structural voxels remaining):
+// below SURRENDER she strikes her colours (boardable); below SINK her hull has
+// failed and she goes down. Enemies SURRENDER EARLY (after just a bit of hull
+// damage — a few solid broadsides), with a wide margin before they'd actually
+// sink, so you usually get a capturable prize rather than having to blow her to
+// matchwood first.
+const INTEGRITY_SURRENDER = 0.90;
+const INTEGRITY_SINK = 0.72; // sinks once ~28% of her hull is shot away (sinks easily)
 
 // Block material ids -> RGB (vertex colors). 0 = empty.
 const BLOCK = {
   EMPTY: 0,
   WOOD: 1, WOOD_DARK: 2, WOOD_LIGHT: 3, DECK: 4, RAIL: 5, MAST: 6, TRIM: 7,
-  CANNON: 8, SAIL: 9, SAIL2: 10, FLAG: 11, SKULL: 12,
+  CANNON: 8, SAIL: 9, SAIL2: 10, FLAG: 11, SKULL: 12, ROPE: 13,
 };
 // Base palette. Sail/flag colors are overridden per-ship at mesh time (see
 // _rebuildMesh / the dynamic color map), so these are just defaults.
@@ -39,6 +48,7 @@ const BLOCK_RGB = {
   10:[0.78, 0.74, 0.62],  // sail shade — overridden per ship
   11:[0.12, 0.12, 0.13],  // flag — overridden per ship
   12:[0.92, 0.90, 0.82],  // skull (pale)
+  13:[0.78, 0.66, 0.40],  // rope (pale manila hemp — stands out as boarding webbing)
 };
 
 function hexToRgb(hex) {
@@ -86,6 +96,23 @@ function buildVoxelLayout(spec) {
   const railTopJ = deckJ + Math.round(1.1 / VS);
   const keelJ = jWater - Math.round(D / VS);
 
+  // Allowed half-beam at a given local z, for a SHIP shape: a fine POINTED BOW
+  // (+Z tapers to a stempost) and a BROAD, near-SQUARE STERN (-Z stays full beam,
+  // just lightly rounded at the transom corners). `pz` is local z, `hbx` the
+  // half-beam at this height, `hlz` the half-length. Returns the max |x| allowed.
+  const beamAtZ = (pz, hbx, hlz) => {
+    const t = pz / Math.max(hlz, 0.001); // -1 (stern) .. +1 (bow)
+    if (t >= 0) {
+      // Bow: elliptical pinch to a point at the stem.
+      return hbx * Math.sqrt(Math.max(0, 1 - t * t * 0.92));
+    }
+    // Stern: hold near-full beam, only rounding the last ~15% (the transom).
+    const a = -t; // 0 amidships .. 1 at the transom
+    if (a < 0.85) return hbx;
+    const u = (a - 0.85) / 0.15; // 0..1 across the transom corner
+    return hbx * Math.sqrt(Math.max(0, 1 - u * u * 0.55));
+  };
+
   // ---- Hull: for each (i,k) column, fill a vertical run from keel up to deck if
   // this column is inside the boat's tapered footprint at that height. We build a
   // SHELL: only the outer ring of each level is solid (walls), plus a solid
@@ -100,10 +127,9 @@ function buildVoxelLayout(spec) {
     for (let i = 0; i < nx; i++) {
       for (let k = 0; k < nz; k++) {
         const p = g2l(i, j, k);
-        // Pointed bow/stern: shrink allowed beam toward the ends (elliptical).
-        const zFrac = Math.abs(p.z) / Math.max(halfLz, 0.001);
-        if (zFrac > 1) continue;
-        const beamHere = halfBx * Math.sqrt(Math.max(0, 1 - zFrac * zFrac * 0.7));
+        // Ship shape: pointed bow, square stern (see beamAtZ).
+        if (Math.abs(p.z) > halfLz) continue;
+        const beamHere = beamAtZ(p.z, halfBx, halfLz);
         const inside = Math.abs(p.x) <= beamHere && Math.abs(p.z) <= halfLz;
         if (!inside) continue;
         // Shell: solid if near the outer edge of this level OR at the very bottom
@@ -130,9 +156,8 @@ function buildVoxelLayout(spec) {
     for (let i = 0; i < nx; i++)
     for (let k = 0; k < nz; k++) {
       const p = g2l(i, j, k);
-      const zFrac = Math.abs(p.z) / Math.max(halfLz, 0.001);
-      if (zFrac > 1) continue;
-      const beamHere = halfBx * Math.sqrt(Math.max(0, 1 - zFrac * zFrac * 0.7));
+      if (Math.abs(p.z) > halfLz) continue;
+      const beamHere = beamAtZ(p.z, halfBx, halfLz);
       if (Math.abs(p.x) <= beamHere - VS * 0.5 && Math.abs(p.z) <= halfLz - VS * 0.5) {
         grid.set(i, j, k, BLOCK.DECK);
       }
@@ -150,9 +175,8 @@ function buildVoxelLayout(spec) {
     for (let i = 0; i < nx; i++)
     for (let k = 0; k < nz; k++) {
       const p = g2l(i, j, k);
-      const zFrac = Math.abs(p.z) / Math.max(halfLz, 0.001);
-      if (zFrac > 1) continue;
-      const beamHere = halfBx * Math.sqrt(Math.max(0, 1 - zFrac * zFrac * 0.7));
+      if (Math.abs(p.z) > halfLz) continue;
+      const beamHere = beamAtZ(p.z, halfBx, halfLz);
       const onRim = (Math.abs(p.x) >= beamHere - VS * 1.2 || Math.abs(p.z) >= halfLz - VS * 1.2)
         && Math.abs(p.x) <= beamHere && Math.abs(p.z) <= halfLz;
       if (!onRim) continue;
@@ -160,6 +184,39 @@ function buildVoxelLayout(spec) {
       const ladderGap = p.x > 0 && Math.abs(p.z) < 1.2;
       if (ladderGap) continue;
       grid.set(i, j, k, BLOCK.RAIL);
+    }
+  }
+
+  // ---- Boarding webbing (rope ratlines): a lattice of tarred-hemp blocks on the
+  // STARBOARD hull side at the rail gap, spanning from the waterline up to the
+  // deck. With the high freeboard the climb is tall, so this gives a visible
+  // hand-over-hand net to scramble aboard (the atLadder climb logic uses this
+  // same starboard amidships zone). Lattice = every other cell, so it reads as
+  // netting rather than a solid wall.
+  {
+    const startJ = jWater - 1;                  // from just below the waterline
+    const endJ = deckJ + Math.round(0.7 / VS);  // up to just over the rail
+    const zHalf = Math.round(1.1 / VS);         // ±cells fore/aft around amidships
+    const [, , kMid] = l2g(0, 0, 0);            // amidships k
+    for (let j = startJ; j <= endJ; j++) {
+      for (let dz = -zHalf; dz <= zHalf; dz++) {
+        const rk = kMid + dz;
+        // Find the OUTERMOST solid hull cell on starboard (+x) in this row, by
+        // scanning inward from the grid edge. Hang the net one cell OUTBOARD of
+        // it — adapts to the real (now asymmetric) hull edge, so EVERY ship gets
+        // webbing regardless of beam.
+        let edgeI = -1;
+        for (let i = nx - 1; i > iCenter; i--) {
+          const v = grid.get(i, j, rk);
+          if (v === BLOCK.WOOD || v === BLOCK.WOOD_DARK || v === BLOCK.WOOD_LIGHT
+            || v === BLOCK.DECK || v === BLOCK.RAIL) { edgeI = i; break; }
+        }
+        if (edgeI < 0) continue;                // no hull here (past the bow/stern)
+        const ropeI = edgeI + 1;                // one cell outboard, exposed
+        // Net pattern: small diagonal gaps so it reads as webbing, not a wall.
+        if ((j + dz) % 3 === 0) continue;
+        if (grid.get(ropeI, j, rk) === BLOCK.EMPTY) grid.set(ropeI, j, rk, BLOCK.ROPE);
+      }
     }
   }
 
@@ -204,49 +261,48 @@ function buildVoxelLayout(spec) {
       }
     }
 
-    // ---- Flag at the masthead of the tallest (first) mast: a small pennant with
-    // a pale skull blotch, flying toward the stern (-Z).
-    if (mIdx === 0) {
-      const flagJ = topJ;
-      for (let dz = 1; dz <= Math.round(2.0 / VS); dz++) {
-        for (let dj = 0; dj <= 1; dj++) {
-          grid.set(mi, flagJ - dj, mk - dz, BLOCK.FLAG);
-        }
-      }
-      // Skull blotch (one pale block) in the flag's middle.
-      grid.set(mi, flagJ, mk - 2, BLOCK.SKULL);
-    }
+    // (No voxel flag here — ships fly a separate 2D faction flag mesh at the
+    // masthead, built/positioned by the VoxelShip, so the old block-pennant is
+    // gone to avoid clipping with it.)
   }
 
   // ---- Cannon blocks: a black iron barrel sitting ON the deck at the rail,
   // poking out through the bulwark. The barrel occupies the OUTER cells by the
   // rail; the gunner stands one cell INBOARD on clear deck (see
   // _buildCannons/cannonStandWorld, which must match these z positions).
-  const cannonZs = [];
-  {
-    const nPerSide = spec.cannonsPerSide || 0;
-    const cannonJ = deckJ + 1; // one cell above the deck surface
-    // Cannons live in the FORWARD part of the deck so the aftmost gun clears the
-    // helm/wheel (at z = -L*0.32). Centered slightly forward (+Z) with a tighter
-    // spread; the rearmost cannon ends up around z = -L*0.18, forward of the helm.
+  // Spread `n` gun positions along the forward deck (aftmost clears the helm).
+  const gunZs = (n) => {
+    const out = [];
     const spread = L * 0.56, center = L * 0.10;
-    for (let c = 0; c < nPerSide; c++) {
-      const z = (nPerSide === 1) ? center : center + ((c / (nPerSide - 1)) - 0.5) * spread;
-      cannonZs.push(z);
+    for (let c = 0; c < n; c++) {
+      out.push(n === 1 ? center : center + ((c / (n - 1)) - 0.5) * spread);
     }
-    for (const side of [1, -1]) {
-      for (const z of cannonZs) {
-        // Outer barrel cell = right at the rail (halfB - ~1 cell), poking out.
-        const railCellX = side * (halfB - VS * 1.2);
-        const [bi, , bk] = l2g(railCellX, (cannonJ - jWater) * VS, z);
-        grid.set(bi, cannonJ, bk, BLOCK.CANNON);          // barrel base on deck
-        grid.set(bi + side, cannonJ, bk, BLOCK.CANNON);   // barrel tip through rail
-      }
-    }
-  }
+    return out;
+  };
+  // Punch a barrel through the hull side at grid row `gunJ`, position z, side.
+  const placeGun = (gunJ, z, side) => {
+    const railCellX = side * (halfB - VS * 1.2);
+    const [bi, , bk] = l2g(railCellX, (gunJ - jWater) * VS, z);
+    grid.set(bi, gunJ, bk, BLOCK.CANNON);          // barrel base
+    grid.set(bi + side, gunJ, bk, BLOCK.CANNON);   // barrel tip through the side
+  };
+
+  // ---- UPPER battery: on the main deck, one cell above the deck surface. ----
+  const cannonZs = gunZs(spec.cannonsPerSide || 0);
+  const upperGunJ = deckJ + 1;
+  for (const side of [1, -1]) for (const z of cannonZs) placeGun(upperGunJ, z, side);
+
+  // ---- LOWER gun deck: a second row of ports punched through the hull side a
+  // little above the waterline (down where the heavy guns sit on a real ship).
+  // These fire too (see _buildCannons), so big hulls throw a much heavier weight
+  // of metal from two stacked broadsides.
+  const lowerCannonZs = gunZs(spec.lowerGunsPerSide || 0);
+  const lowerGunJ = jWater + 1; // just above the waterline
+  for (const side of [1, -1]) for (const z of lowerCannonZs) placeGun(lowerGunJ, z, side);
 
   return { grid, g2l, l2g, jWater, deckJ, railTopJ, iCenter, kCenter,
-    deckYLocal: (deckJ - jWater) * VS, cannonZs, halfB, mastInfo };
+    deckYLocal: (deckJ - jWater) * VS, cannonZs, lowerCannonZs,
+    lowerGunYLocal: (lowerGunJ - jWater) * VS, halfB, mastInfo };
 }
 
 // ---- Face-culled mesher: emit a quad only where a solid voxel faces empty ----
@@ -401,7 +457,7 @@ export class VoxelShip {
       this._rgb[BLOCK.SAIL]  = s;
       this._rgb[BLOCK.SAIL2] = [s[0]*0.82, s[1]*0.82, s[2]*0.82];
     }
-    if (opts.flagColor !== undefined) this._rgb[BLOCK.FLAG] = hexToRgb(opts.flagColor);
+    if (opts.flagColor !== undefined) { this._flagColor = opts.flagColor; this._rgb[BLOCK.FLAG] = hexToRgb(opts.flagColor); }
 
     // Sun/fog uniforms driven from the main loop.
     this.sunDir = new Vec3(0, 1, 0);
@@ -424,8 +480,16 @@ export class VoxelShip {
     this.right = new Vec3();
     this.quaternion = new Quat();
 
-    // Combat.
-    this.hp = spec.hp; this.maxHp = spec.hp;
+    // Combat. HP is TIED TO HULL VOXELS: a ship's "health" is literally how much
+    // hull she has left. maxHp scales with her original hull-block count (so a
+    // man-o-war with thousands of blocks is far tougher than a cutter), and
+    // damage is taken by carving voxels — `hp` tracks the surviving hull. She
+    // SURRENDERS / SINKS by INTEGRITY (% of hull blocks remaining), so a ship
+    // shot to swiss cheese goes down even if a raw HP number wouldn't say so.
+    this._hullVoxels0 = this._countHullVoxels();   // original structural block count
+    this._hullVoxels = this._hullVoxels0;
+    this.maxHp = Math.max(40, Math.round(this._hullVoxels0 * HP_PER_VOXEL));
+    this.hp = this.maxHp;
     this.sunk = false; this._reload = 0;
     this._sinking = false; this._sinkT = 0; this._removed = false;
     this.flash = 0; // hit-flash amount (0..1), decays in update()
@@ -478,6 +542,21 @@ export class VoxelShip {
     scene.add(this.wheelMesh);
     // Mount just forward of the helm stand, standing on the deck.
     this.wheelLocal = new Vec3(0, this.deckLocalY(), -this.spec.length * 0.30);
+
+    // ---- Faction FLAG at the masthead: a distinctive 2D flag so you can ID a
+    // ship's allegiance at a glance. Flown at the top of the FIRST (tallest) mast;
+    // hidden when that mast is shot away. Player ships fly no faction flag (they
+    // already have their crimson sails + jolly roger).
+    // Player ships fly their OWN distinctive colours ('player'); enemies fly their
+    // faction flag.
+    this._flagFaction = (this.faction === 'player') ? 'player' : (this.crewType || null);
+    if (this._flagFaction) {
+      this.factionFlag = buildFactionFlag(scene.device, this._flagFaction);
+      scene.add(this.factionFlag);
+      const m0 = this.spec.masts[0] || { z: 0 };
+      // Just below the masthead, flying aft (-Z handled by the flag's own shape).
+      this.flagLocal = new Vec3(0, this.deckLocalY() + this.spec.mastH * 0.92, m0.z);
+    }
   }
 
   _rebuildMesh() {
@@ -569,8 +648,10 @@ export class VoxelShip {
     for (let di = -reach; di <= reach; di++) {
       const i = ci + di, j = cj + dj, k = ck + dk;
       const v = this.grid.get(i, j, k);
-      // Cloth (sails/flag) is NON-COLLIDING — you walk under/through it.
-      if (v === 0 || v === BLOCK.SAIL || v === BLOCK.SAIL2 || v === BLOCK.FLAG || v === BLOCK.SKULL) continue;
+      // Cloth (sails/flag) and ROPE webbing are NON-COLLIDING — you walk/climb
+      // through them rather than bonking off.
+      if (v === 0 || v === BLOCK.SAIL || v === BLOCK.SAIL2 || v === BLOCK.FLAG
+          || v === BLOCK.SKULL || v === BLOCK.ROPE) continue;
       const c = this._g2l(i, j, k);            // voxel center (local)
       const h = VS / 2 + rad;
       const dx = l.x - c.x, dy = l.y - c.y, dz = l.z - c.z;
@@ -597,16 +678,30 @@ export class VoxelShip {
     const cannons = [];
     const hx = this.spec.beam / 2;
     const deckY = this.deckLocalY();
-    // Use the SAME z positions the layout placed cannon blocks at.
-    const zs = this._layout.cannonZs || [];
     const barrelX = hx - VS * 1.2;         // gun sits at the rail (matches blocks)
     const standX = hx - VS * 2.6;          // gunner stands well inboard on clear deck
+    // UPPER battery — on the main deck; these can be MANNED individually (a stand
+    // position on clear deck) and also fire as part of a broadside.
+    const upperZs = this._layout.cannonZs || [];
     for (const side of [1, -1]) {
-      for (const z of zs) {
+      for (const z of upperZs) {
         cannons.push({
-          side, z, reload: 0,
+          side, z, reload: 0, deck: 'upper', manned: true,
           barrelLocal: new Vec3(side * barrelX, deckY + VS, z),
           standLocal:  new Vec3(side * standX,  deckY + 0.05, z),
+        });
+      }
+    }
+    // LOWER battery — down near the waterline (below deck). Fires with broadsides
+    // but can't be individually manned (no walkable stand down there).
+    const lowerZs = this._layout.lowerCannonZs || [];
+    const lowerY = this._layout.lowerGunYLocal != null ? this._layout.lowerGunYLocal : 0.6;
+    for (const side of [1, -1]) {
+      for (const z of lowerZs) {
+        cannons.push({
+          side, z, reload: 0, deck: 'lower', manned: false,
+          barrelLocal: new Vec3(side * barrelX, lowerY, z),
+          standLocal:  new Vec3(side * standX,  lowerY, z),
         });
       }
     }
@@ -654,6 +749,7 @@ export class VoxelShip {
     const l = this.worldToLocal(worldPos, new Vec3());
     let best = null, bestD = maxDist * maxDist;
     for (const c of this.cannons) {
+      if (c.manned === false) continue; // lower-deck guns can't be hand-manned
       const dx = l.x - c.standLocal.x, dz = l.z - c.standLocal.z; // distance on deck
       const d = dx*dx + dz*dz;
       if (d < bestD) { bestD = d; best = c; }
@@ -674,16 +770,54 @@ export class VoxelShip {
   // (loot lost). Once surrendered, further hull hits push toward sinking.
   damage(amount) {
     if (this.sunk) return false;
-    this.hp = Math.max(0, this.hp - amount);
-    if (this.hp <= 0) { this.sunk = true; return 'sunk'; }
-    // Surrender threshold (only for crewed enemy ships, not the player's). 30%
-    // gives margin so you don't accidentally SINK (and lose the loot) of a ship
-    // you meant to disable.
-    if (!this.surrendered && this.faction === 'enemy' && this.hp <= this.maxHp * 0.30) {
+    // HP is now purely a DISPLAY that mirrors HULL INTEGRITY (what the HUD shows
+    // and the hit-flash uses). The carving in carveSphere() already updated the
+    // integrity; the SINK/SURRENDER verdict reads it directly, so a hull riddled
+    // into swiss cheese founders no matter what an abstract HP number says.
+    // (`amount` is unused for the verdict now — voxel loss is the truth.)
+    const integ = this.hullIntegrity();
+    this.hp = Math.max(0, Math.round(this.maxHp * integ));
+
+    // SINK: hull integrity has collapsed — she founders.
+    if (integ <= INTEGRITY_SINK) { this.sunk = true; return 'sunk'; }
+    // SURRENDER: badly holed but still afloat — crewed enemies strike their
+    // colours (stay boardable for loot). The player's ship never surrenders.
+    if (!this.surrendered && this.faction === 'enemy' && integ <= INTEGRITY_SURRENDER) {
       this.surrender();
       return 'surrender';
     }
     return false;
+  }
+
+  // Fully REPAIR the hull at the cove: rebuild her pristine voxel grid from spec
+  // (replanking every hole, re-stepping every mast), restoring full integrity +
+  // hp and clearing the disabled/surrendered state. Returns true.
+  repairHull() {
+    const layout = buildVoxelLayout(this.spec);
+    this.grid = layout.grid;
+    this._g2l = layout.g2l;
+    this._l2g = layout.l2g;
+    this._layout = layout;
+    this.deckYLocal = layout.deckYLocal;
+    this.masts = (layout.mastInfo || []).map(m => ({ ...m, standing: true }));
+    this.cannons = this._buildCannons();
+    this._hullVoxels0 = this._countHullVoxels();
+    this._hullVoxels = this._hullVoxels0;
+    this.maxHp = Math.max(40, Math.round(this._hullVoxels0 * HP_PER_VOXEL));
+    this.hp = this.maxHp;
+    this.disabled = false; this.surrendered = false; this.sunk = false;
+    this._sinking = false; this._sinkT = 0; this._removed = false; this.flash = 0;
+    // Clear any floating toppled-mast debris from before the repair.
+    if (this._debris) { for (const d of this._debris) if (d.mesh) this.scene.remove(d.mesh); this._debris.length = 0; }
+    // Restore her colours (undo the white surrender flag) and re-mesh the fresh
+    // hull. Make the ship + its fittings visible again.
+    if (this._flagColor !== undefined) this._rgb[BLOCK.FLAG] = hexToRgb(this._flagColor);
+    this._rgb[BLOCK.SKULL] = [0.92, 0.90, 0.82];
+    this._rebuildMesh();
+    if (this.mesh) this.mesh.visible = true;
+    if (this.wheelMesh) this.wheelMesh.visible = true;
+    if (this.factionFlag) this.factionFlag.visible = true;
+    return true;
   }
 
   // Ship gives up: dead in the water, sails struck, white flag. Stays afloat and
@@ -709,19 +843,46 @@ export class VoxelShip {
     this._rgb[BLOCK.SKULL] = [0.85, 0.85, 0.85];
     this._rebuildMesh();
   }
+  // Count STRUCTURAL hull voxels (the planking/deck/rail that make her a hull).
+  // Masts, sails, flag, cannons and rope webbing aren't "hull integrity", so
+  // they're excluded — shooting away her rigging doesn't sink her, holing her
+  // hull does.
+  _countHullVoxels() {
+    const data = this.grid.data;
+    let n = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (v === BLOCK.WOOD || v === BLOCK.WOOD_DARK || v === BLOCK.WOOD_LIGHT
+        || v === BLOCK.DECK || v === BLOCK.RAIL || v === BLOCK.TRIM) n++;
+    }
+    return n;
+  }
+  // Fraction of original hull remaining (1 = pristine, 0 = obliterated).
+  hullIntegrity() {
+    return this._hullVoxels0 > 0 ? this._hullVoxels / this._hullVoxels0 : 1;
+  }
+
   // World impact -> remove voxels within radiusCells (cell units) of the point.
+  // Tracks how many STRUCTURAL hull blocks were blown away, so hull integrity
+  // (and thus surrender/sink) follows the real swiss-cheesing of the hull.
   carveSphere(worldPos, radiusCells = 2) {
     const l = this.worldToLocal(worldPos, new Vec3());
     const [ci, cj, ck] = this._l2g(l.x, l.y, l.z);
     const r = Math.ceil(radiusCells);
-    let removed = 0;
+    let removed = 0, hullRemoved = 0;
     for (let dj = -r; dj <= r; dj++)
     for (let dk = -r; dk <= r; dk++)
     for (let di = -r; di <= r; di++) {
       if (di*di + dj*dj + dk*dk > radiusCells * radiusCells) continue;
       const i = ci + di, j = cj + dj, k = ck + dk;
-      if (this.grid.solid(i, j, k)) { this.grid.set(i, j, k, 0); removed++; }
+      const v = this.grid.get(i, j, k);
+      if (v !== 0) {
+        if (v === BLOCK.WOOD || v === BLOCK.WOOD_DARK || v === BLOCK.WOOD_LIGHT
+          || v === BLOCK.DECK || v === BLOCK.RAIL || v === BLOCK.TRIM) hullRemoved++;
+        this.grid.set(i, j, k, 0); removed++;
+      }
     }
+    if (hullRemoved) this._hullVoxels = Math.max(0, this._hullVoxels - hullRemoved);
     if (removed) { this._rebuildMesh(); this._checkMasts(); }
     return removed;
   }
@@ -751,6 +912,32 @@ export class VoxelShip {
         }
       }
       if (breakJ >= 0) this._toppleMast(m, breakJ);
+    }
+    // SAFETY SWEEP — strip any ORPHANED rigging/spar: a sail/flag/skull/MAST voxel
+    // ABOVE THE DECK with no STANDING MAST near it can't hang in the air, so remove
+    // it. Catches yardarm (mast) pieces + billowed sails the topple box missed.
+    // `reach` covers the yardarm half-width so a STANDING mast's own spar survives.
+    {
+      const data = this.grid.data, nx = this.grid.nx, ny = this.grid.ny, nz = this.grid.nz;
+      const standMasts = this.masts.filter(o => o.standing);
+      const yardReach = Math.round((this.spec.beam * 0.6) / VS) + 2;
+      const supported = (i, k) => {
+        for (const o of standMasts) {
+          if (Math.abs(i - o.mi) <= yardReach && Math.abs(k - o.mk) <= yardReach) return true;
+        }
+        return false;
+      };
+      const deckJ = this._layout.deckJ;
+      let stripped = false;
+      for (let k = 0; k < nz; k++)
+      for (let i = 0; i < nx; i++) {
+        if (supported(i, k)) continue;
+        for (let j = deckJ + 1; j < ny; j++) { // above-deck only — never touch hull/deck
+          const idx = (k * ny + j) * nx + i, v = data[idx];
+          if (v === BLOCK.SAIL || v === BLOCK.SAIL2 || v === BLOCK.FLAG || v === BLOCK.SKULL || v === BLOCK.MAST) { data[idx] = 0; stripped = true; }
+        }
+      }
+      if (stripped) this._rebuildMesh();
     }
     // Lost the means to sail? Disabled if all masts are down OR essentially all
     // the SAIL CLOTH has been shot away (no canvas = no way to make way).
@@ -782,22 +969,38 @@ export class VoxelShip {
     return true;
   }
 
-  // Topple a mast from `fromJ` upward: collect its remaining voxels above the
-  // break into a falling debris piece, clear them from the ship grid, re-mesh.
+  // Topple a mast: when it snaps anywhere, the WHOLE spar (and all its canvas +
+  // flag) comes down — collect every mast/sail/flag voxel on this mast from the
+  // deck up into a falling debris piece, clear them from the ship grid, re-mesh.
+  // (We sweep from the base, not just the break point, so sails below a high
+  // break don't stay hanging on the stump.)
   _toppleMast(m, fromJ) {
     m.standing = false;
     const cells = [];
-    const yardHalf = Math.round((this.spec.beam * 0.6) / VS) + 1;
-    const dkRange = yardHalf + 3; // extra +Z reach to catch the billowed sail cells
-    for (let j = fromJ; j <= m.topJ + 1; j++)
-    for (let di = -yardHalf; di <= yardHalf; di++)
-    for (let dk = -dkRange; dk <= dkRange; dk++) {
-      const i = m.mi + di, k = m.mk + dk;
-      const v = this.grid.get(i, j, k);
-      if (v === BLOCK.MAST || v === BLOCK.SAIL || v === BLOCK.SAIL2 || v === BLOCK.FLAG || v === BLOCK.SKULL) {
-        cells.push({ i, j, k, v });
-        this.grid.set(i, j, k, 0);
+    // Whole-grid sweep so NOTHING is left floating: this mast's MAST column comes
+    // down entirely, and EVERY rigging voxel (sail/flag/skull) belonging to it
+    // does too. A rigging cell "belongs" to this mast if this (fallen) mast is the
+    // nearest by its base column — i.e. it's not held up by a still-standing mast.
+    const standing = this.masts.filter(o => o !== m && o.standing);
+    const ownsCell = (i, k) => {
+      const dThis = (i - m.mi) ** 2 + (k - m.mk) ** 2;
+      for (const o of standing) {
+        if ((i - o.mi) ** 2 + (k - o.mk) ** 2 < dThis) return false; // a standing mast is closer
       }
+      return true;
+    };
+    const data = this.grid.data, nx = this.grid.nx, ny = this.grid.ny, nz = this.grid.nz;
+    for (let k = 0; k < nz; k++)
+    for (let j = m.baseJ + 1; j < ny; j++)
+    for (let i = 0; i < nx; i++) {
+      const v = data[(k * ny + j) * nx + i];
+      if (v !== BLOCK.MAST && v !== BLOCK.SAIL && v !== BLOCK.SAIL2 && v !== BLOCK.FLAG && v !== BLOCK.SKULL) continue;
+      // Everything owned by THIS mast comes down: its column, its YARDARM (mast
+      // blocks offset sideways), and all its rigging — whichever fallen mast it's
+      // nearest to (so a still-standing neighbour keeps its own spar).
+      if (!ownsCell(i, k)) continue;
+      cells.push({ i, j, k, v });
+      this.grid.set(i, j, k, 0);
     }
     if (cells.length === 0) return;
     this._rebuildMesh();
@@ -945,7 +1148,10 @@ export class VoxelShip {
     const rPort = sampleDir(0, -halfB), rStar = sampleDir(0, halfB);
     const rCenter = SEA_LEVEL + sampleOceanHeight(upN, t);
 
-    const draft = this.spec.depth * 0.12;
+    // A NEGATIVE draft factor lifts the ship's waterline a touch ABOVE the sea
+    // surface so she rides high out of the water (more visible hull) rather than
+    // squatting into it — while the lower hull still meets the water.
+    const draft = this.spec.depth * -0.18;
     let ridR = rCenter - draft;
     let sinkRoll = 0;
     if (this._sinking) {
@@ -993,6 +1199,17 @@ export class VoxelShip {
       if (this.wheelMesh._wheel) {
         this._wheelSpin = (this._wheelSpin || 0) + this.rudder * dt * 3.0;
         this.wheelMesh._wheel.quaternion.setFromAxisAngle(new Vec3(0, 0, 1), this._wheelSpin);
+      }
+    }
+
+    // Ride the faction FLAG at the masthead; strike it (hide) once the first mast
+    // is shot down or the ship is gone.
+    if (this.factionFlag) {
+      const mastUp = this.masts[0] ? this.masts[0].standing : true;
+      this.factionFlag.visible = !this._removed && !this.sunk && mastUp;
+      if (this.factionFlag.visible) {
+        this.localToWorld(this.flagLocal, this.factionFlag.position);
+        this.factionFlag.quaternion.copy(this.quaternion);
       }
     }
   }

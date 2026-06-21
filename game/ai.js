@@ -303,14 +303,39 @@ export class ShipAI {
     ship.setControls({ rudder, sailDelta });
 
     // --- Fire if a broadside is lined up and in range. Lead is already baked
-    // into combatSide (we only set it when the LEAD point is abeam). ---
+    // into combatSide (we only set it when the LEAD point is abeam). HOLD FIRE if
+    // a friendly (non-hostile) ship is in the line of fire on that side. ---
     if (combatSide !== 0 && this._fireCd <= 0 && target) {
       const dist = target.position.clone().sub(ship.position).length();
       const canFire = prey ? dist < this.standoff * 1.3 : dist < this.engageRange;
-      if (canFire && this.combat.fireBroadside(ship, combatSide, audio)) {
+      if (canFire && !this._friendlyInLine(combatSide, right) &&
+          this.combat.fireBroadside(ship, combatSide, audio)) {
         // Faster, more aggressive cannonading; prey fire desperately but rarely.
         this._fireCd = prey ? 5 : (2.2 + Math.random() * 1.0);
       }
     }
+  }
+
+  // Would firing the `side` broadside hit a FRIENDLY ship? Casts a ray straight
+  // out the beam and checks for any non-hostile ship close to that line within
+  // engage range. `right` is the ship's starboard unit vector. Returns true if a
+  // friendly is in the firing lane (so we should HOLD FIRE).
+  _friendlyInLine(side, right) {
+    const me = this.ship;
+    const myFac = factionOf(me);
+    const beamDir = right.clone().multiplyScalar(side);  // outward along the guns
+    const range = this.engageRange + 10;
+    const LANE = me.spec.beam * 0.5 + 8;                  // half-width of the danger lane
+    for (const s of this.getShips()) {
+      if (s === me || s.sunk) continue;
+      // Only friendlies block our fire; we're happy to shoot through hostiles.
+      if (isHostile(myFac, factionOf(s))) continue;
+      const to = s.position.clone().sub(me.position);
+      const along = to.dot(beamDir);
+      if (along <= 0 || along > range) continue;           // not out the firing side / too far
+      const perp = to.addScaledVector(beamDir, -along).length(); // lateral offset from the lane
+      if (perp < LANE + s.spec.beam * 0.5) return true;    // friendly in the line of fire
+    }
+    return false;
   }
 }

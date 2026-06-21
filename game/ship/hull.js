@@ -20,21 +20,56 @@ const DECK_COL   = 0x9c7b4a;
 const SAIL_COL   = 0xe8e0cc;
 const TRIM_COL   = 0x3a2a18;
 
+// Ship classes, smallest/weakest to largest/strongest. `tier` orders them for
+// difficulty scaling (the fleet spawns tougher hulls as the player's ship tier
+// rises). The voxel builder is fully parametric off length/beam/masts/
+// cannonsPerSide, so adding a class here is all that's needed for it to mesh,
+// arm, and sail.
+// `deckY` is the FREEBOARD — how high the main deck sits above the waterline
+// (ships ride high out of the water). `cannonsPerSide` is the UPPER-deck battery;
+// `lowerGunsPerSide` adds a second gun row down at the waterline (lower gun deck).
 export const SHIP_SPECS = {
+  // --- Tier 0: tiny & fast scouts ---
+  cutter: {
+    name: 'Cutter', tier: 0, length: 11, beam: 4.4, depth: 2.6, deckY: 2.4,
+    mastH: 9, masts: [{ z: 0.5 }], crew: 3, hp: 220, speed: 1.15,
+    cannonsPerSide: 2, lowerGunsPerSide: 0,
+  },
+  // --- Tier 1: small single-masted ---
   sloop: {
-    name: 'Sloop', length: 14, beam: 5.2, depth: 3.0, deckY: 1.2,
-    mastH: 11, masts: [{ z: 0.5 }], crew: 4, hp: 100, speed: 1.0,
-    cannonsPerSide: 2,
+    name: 'Sloop', tier: 1, length: 14, beam: 5.2, depth: 3.0, deckY: 2.8,
+    mastH: 11, masts: [{ z: 0.5 }], crew: 4, hp: 320, speed: 1.0,
+    cannonsPerSide: 2, lowerGunsPerSide: 2,
   },
+  // --- Tier 2: nimble two-master ---
+  schooner: {
+    name: 'Schooner', tier: 2, length: 17, beam: 5.8, depth: 3.2, deckY: 3.1,
+    mastH: 13, masts: [{ z: 3 }, { z: -3 }], crew: 6, hp: 440, speed: 1.02,
+    cannonsPerSide: 3, lowerGunsPerSide: 2,
+  },
+  // --- Tier 3: workhorse two-master ---
   brig: {
-    name: 'Brig', length: 20, beam: 6.6, depth: 3.6, deckY: 1.5,
-    mastH: 14, masts: [{ z: 3 }, { z: -4 }], crew: 8, hp: 180, speed: 0.92,
-    cannonsPerSide: 4,
+    name: 'Brig', tier: 3, length: 20, beam: 6.6, depth: 3.6, deckY: 3.5,
+    mastH: 14, masts: [{ z: 3 }, { z: -4 }], crew: 8, hp: 580, speed: 0.92,
+    cannonsPerSide: 4, lowerGunsPerSide: 3,
   },
+  // --- Tier 4: heavy three-master warship ---
+  frigate: {
+    name: 'Frigate', tier: 4, length: 24, beam: 7.4, depth: 4.0, deckY: 3.9,
+    mastH: 16, masts: [{ z: 6 }, { z: -1 }, { z: -7 }], crew: 11, hp: 820, speed: 0.86,
+    cannonsPerSide: 5, lowerGunsPerSide: 4,
+  },
+  // --- Tier 5: fat treasure/war galleon ---
   galleon: {
-    name: 'Galleon', length: 28, beam: 8.4, depth: 4.4, deckY: 1.9,
-    mastH: 18, masts: [{ z: 7 }, { z: -1 }, { z: -8 }], crew: 14, hp: 320, speed: 0.8,
-    cannonsPerSide: 6,
+    name: 'Galleon', tier: 5, length: 28, beam: 8.4, depth: 4.4, deckY: 4.3,
+    mastH: 18, masts: [{ z: 7 }, { z: -1 }, { z: -8 }], crew: 14, hp: 1050, speed: 0.8,
+    cannonsPerSide: 6, lowerGunsPerSide: 5,
+  },
+  // --- Tier 6: the dreaded ship of the line ---
+  manowar: {
+    name: 'Man-o-War', tier: 6, length: 34, beam: 9.8, depth: 5.0, deckY: 4.8,
+    mastH: 21, masts: [{ z: 10 }, { z: 2 }, { z: -6 }, { z: -12 }], crew: 22, hp: 1700, speed: 0.74,
+    cannonsPerSide: 8, lowerGunsPerSide: 7,
   },
 };
 

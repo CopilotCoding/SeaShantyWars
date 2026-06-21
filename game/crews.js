@@ -42,22 +42,73 @@ export function crewColor(crewTypeKey) {
 }
 
 // ---- Faction hostility ----
-// A ship's "faction" for AI purposes is its crewType; the PLAYER counts as a
-// 'pirate'. isHostile(a, b) = does a want to attack b?
-//   military : attacks pirates (+player). Friendly to civilian/merchant/military.
-//   civilian/merchant : attacks pirates (+player) — but they FLEE (handled in AI).
+// A ship's "faction" for AI purposes is its crewType; the PLAYER is its OWN
+// faction ('player'), starting NEUTRAL with everyone (see reputation below).
+// NPC-vs-NPC rules:
+//   military : attacks pirates. Friendly to civilian/merchant/military.
+//   civilian/merchant : attacks pirates — but they FLEE (handled in AI).
 //   pirate   : attacks EVERYONE, including other pirates.
 export function factionOf(ship) {
   if (!ship) return null;
-  if (ship.faction === 'player') return 'pirate'; // the player is a pirate
+  if (ship.faction === 'player') return 'player';
   return ship.crewType || 'pirate';
+}
+
+// ---- REPUTATION ----
+// The player starts NEUTRAL (0) with each faction. Attacking ships of a faction
+// drops your standing with them and raises it with their RIVALS. When your
+// standing with a faction falls below HOSTILE_REP, they turn on you; above
+// FRIENDLY_REP they treat you as an ally and won't fire first.
+const FACTIONS = ['pirate', 'military', 'merchant', 'civilian'];
+export const reputation = { pirate: 0, military: 0, merchant: 0, civilian: 0 };
+const REP_MIN = -100, REP_MAX = 100;
+export const HOSTILE_REP = -25;   // at/below this, the faction attacks you
+const FRIENDLY_REP = 25;          // at/above this, they consider you an ally
+
+// Who gains when you attack a given faction (their rivals approve). Hunting
+// pirates pleases everyone lawful; preying on civilians/merchants pleases pirates
+// and angers the navy; fighting navy pleases pirates.
+const RIVALS = {
+  pirate:   ['military', 'merchant', 'civilian'], // everyone lawful likes pirate-hunters
+  military: ['pirate'],                           // only pirates cheer navy losses
+  merchant: ['pirate'],
+  civilian: ['pirate'],
+};
+
+const clampRep = (v) => Math.max(REP_MIN, Math.min(REP_MAX, v));
+
+// Record the player attacking a ship of `victimFaction` (a hit / kill). Drops rep
+// with that faction and nudges up their rivals'. `weight` scales the swing.
+export function playerAttacked(victimFaction, weight = 1) {
+  if (!FACTIONS.includes(victimFaction)) return;
+  reputation[victimFaction] = clampRep(reputation[victimFaction] - 6 * weight);
+  for (const r of (RIVALS[victimFaction] || [])) {
+    if (r === victimFaction) continue;
+    reputation[r] = clampRep(reputation[r] + 2 * weight);
+  }
+  // The NAVY protects the innocent: preying on civilians/merchants angers them
+  // directly (on top of the rival bonus pirates get for the same act).
+  if (victimFaction === 'civilian' || victimFaction === 'merchant') {
+    reputation.military = clampRep(reputation.military - 5 * weight);
+  }
+}
+
+export function repWith(faction) { return reputation[faction] ?? 0; }
+export function factionStanding(faction) {
+  const r = repWith(faction);
+  if (r <= HOSTILE_REP) return 'hostile';
+  if (r >= FRIENDLY_REP) return 'allied';
+  return 'neutral';
 }
 
 export function isHostile(aFaction, bFaction) {
   if (!aFaction || !bFaction) return false;
+  // Player involved: hostility is driven by REPUTATION, not fixed faction rules.
+  if (aFaction === 'player') return repWith(bFaction) <= HOSTILE_REP;   // do I attack them?
+  if (bFaction === 'player') return repWith(aFaction) <= HOSTILE_REP;   // do they attack me?
+  // NPC vs NPC: the classic rules.
   if (aFaction === 'pirate') return true;          // pirates attack anyone (even pirates)
-  // military / civilian / merchant: hostile only to pirates.
-  return bFaction === 'pirate';
+  return bFaction === 'pirate';                    // lawful factions hate pirates
 }
 
 // Civilians & merchants are PREY — they flee rather than hunt.
@@ -66,12 +117,18 @@ export function isPrey(faction) {
 }
 
 // ---- Crew complement: how many defenders stand on the deck, and their mix of
-// melee (cutlass) vs ranged (musket) fighters. Tougher factions field more, and
-// more aggressive, crew. Civilians barely resist; navy decks are a wall of men.
-export function crewComplement(crewTypeKey) {
+// melee (cutlass) vs ranged (musket) fighters. Scales with BOTH the faction
+// (tougher crews resist harder) AND the ship's SIZE (a man-o-war's deck is a
+// wall of men; a cutter has a handful). `spec` is the ship's SHIP_SPECS entry.
+export function crewComplement(crewTypeKey, spec = null) {
   const ct = CREW_TYPES[crewTypeKey] || CREW_TYPES.merchant;
-  // Base count scales with fightChance; melee/ranged split varies by faction.
-  const count = Math.max(0, Math.round(1 + ct.fightChance * 6)); // 1..7
+  // Faction base: how willing they are to fight (1..7 from fightChance).
+  const factionBase = 1 + ct.fightChance * 6;
+  // Ship-size factor from the hull's nominal crew (sloop≈4 -> ~1.0, manowar≈22
+  // -> ~3.5). Bigger decks field proportionally more defenders.
+  const sizeFactor = spec && spec.crew ? Math.max(0.6, spec.crew / 5) : 1;
+  // Final count, capped so even a man-o-war's deck stays winnable on foot.
+  const count = Math.max(0, Math.min(16, Math.round(factionBase * sizeFactor)));
   // Navy/pirate field more musketmen; merchants mostly a few melee bodies.
   const rangedFrac = crewTypeKey === 'military' ? 0.5
                    : crewTypeKey === 'pirate'   ? 0.4

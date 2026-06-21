@@ -12,6 +12,7 @@ import { Combat } from './combat.js';
 import { Fleet } from './fleet.js';
 import { Cove } from './cove.js';
 import { buildCrewMesh } from './crew/crewVoxel.js';
+import { playerAttacked, factionOf, factionStanding, reputation } from './crews.js';
 import { Vec3, quatFromBasis } from './engine.js';
 
 // Marching-cubes lookup tables (edgeTable/triTable) load as globals via a
@@ -103,8 +104,15 @@ async function startGame(seed) {
   // Juice on every cannonball hit. The sea is full of NPC-vs-NPC battles now, so
   // only react with shake/sound to hits ON the player's ship or near the camera;
   // distant faction battles get the flash + (for sink/surrender) a toast only.
-  combat.onHit = (hitShip, worldPos, result) => {
+  combat.onHit = (hitShip, worldPos, result, owner) => {
     const nearPlayer = worldPos.clone().sub(camera.camera.position).length() < 60;
+    // REPUTATION: if one of YOUR ships (faction 'player') landed this shot on a
+    // non-player ship, your standing with that ship's faction drops (and rises
+    // with their rivals).
+    if (owner && owner.faction === 'player' && hitShip && hitShip.faction !== 'player') {
+      const vic = hitShip.crewType || 'pirate';
+      playerAttacked(vic, result === 'sunk' ? 2 : 1); // sinking counts double
+    }
     // Sound is now spatial (attenuated by distance from the listener), so we can
     // always play it — distant faction battles come through faint, not silent.
     if (audio.playHit) audio.playHit(worldPos);
@@ -182,12 +190,12 @@ async function startGame(seed) {
   let activeShip = ship;
   // For fading the helm/gun action hint after a few seconds in that mode.
   let _lastMode = 'foot', _modeShownT = 0;
-  // Plunder economy: gold you CARRY (on your person — lost if you die at sea,
-  // banked when you reach your cove) vs gold STORED safe at the cove. Spending
-  // at the cove (repair/buy) draws from the combined purse; selling/banking adds
-  // to stored. Carried resets to 0 on death or on docking (it's deposited).
-  let gold = 0;            // carried
-  let goldStored = 0;      // banked at the cove
+  // Plunder economy: gold lives ON YOUR ACTIVE SHIP (`gold`) — plunder fills the
+  // ship you're sailing, it follows you when you SWAP ships, and it goes DOWN
+  // WITH THE HULL if that ship sinks (or you lose her). Reaching your cove BANKS
+  // it into `goldStored` (safe forever). Repair/buy spends stored first.
+  let gold = 0;            // gold aboard the active ship (lost if she sinks)
+  let goldStored = 0;      // banked safe at the cove
 
   // ---- Player health (for boarding combat) ----
   // No always-on bar: health is shown as a RED VIGNETTE that closes in (eats
@@ -210,6 +218,7 @@ async function startGame(seed) {
   const _healthValEl = document.getElementById('health-val');
   const _coveArrowEl = document.getElementById('cove-arrow');
   const _coveDistEl = document.getElementById('cove-dist');
+  const _repEl = document.getElementById('rep-line');
   // Apply damage to the player (called by enemy crew / cannonballs). Handles
   // death + the hit pulse + sound.
   function damagePlayer(n) {
@@ -223,9 +232,11 @@ async function startGame(seed) {
   // True if a ship is still a usable vessel (afloat, not sunk/sinking/removed).
   function shipAfloat(s) { return s && !s.sunk && !s._sinking && !s._removed; }
 
-  // The vessel the player should respawn onto: their home ship if it's still
-  // afloat, else any captured ship still afloat, else null (need a fresh one).
+  // The vessel the player should respawn onto: the ship you were ACTIVELY
+  // sailing if it's afloat (the one that matters to you right now), else your
+  // home ship, else any captured ship still afloat, else null (need a fresh one).
   function pickRespawnShip() {
+    if (shipAfloat(activeShip)) return activeShip;
     if (shipAfloat(ship)) return ship;
     if (fleet && fleet.owned) {
       for (const s of fleet.owned) if (shipAfloat(s)) return s;
@@ -284,14 +295,29 @@ async function startGame(seed) {
     _dead = false; _drowned = false; playerHp = PLAYER_MAX_HP; _hitPulse = 0;
     breath = SWIM_SECONDS; // catch your breath on respawn
     controlMode = 'foot'; mannedCannon = null;
-    if (gold > 0) { flashToast(`You lost ${gold} carried gold when you fell.`); gold = 0; }
 
     let home = pickRespawnShip();
     let freshStart = false;
+    // A derelict (dismasted, can't sail) is no good to respawn onto — you'd be
+    // stranded. Treat it as "no ship" and launch a fresh starter instead.
+    if (home && home.canStillSail && !home.canStillSail()) home = null;
     if (!home) { home = makeStarterShip(); freshStart = true; }
+    // Gold lives on the ship: adopt whatever gold the respawn vessel holds. If
+    // your ship sank (fresh starter), that gold went down with her — the new
+    // ship's gold is 0. If you respawn on a surviving ship, its gold is intact.
+    gold = home.gold || 0;
     ship = home;            // adopt this as the home ship
     activeShip = home;
     fleet.setPlayerShip(home);
+    // Make sure your respawn vessel can actually SAIL: a captured prize may still
+    // be flagged surrendered/disabled (sails won't raise). Recommission her (if
+    // she has masts) and pull her out of the fleet's "owned-and-furled" list so
+    // her sails aren't forced down every frame — she's your flagship now.
+    home.captured = false; home.surrendered = false; home.disabled = false;
+    home.faction = 'player';
+    if (home.recommission) home.recommission();
+    if (fleet.owned) { const oi = fleet.owned.indexOf(home); if (oi >= 0) fleet.owned.splice(oi, 1); }
+    if (home._towed) { home._towed = false; const ti = _towed.indexOf(home); if (ti >= 0) _towed.splice(ti, 1); }
 
     // Stand the player squarely ON HER DECK (toward the bow, off the mast
     // column) rather than in the water — so collision is solid immediately and
@@ -314,7 +340,10 @@ async function startGame(seed) {
   // mesh is hidden while stored; "sail out" swaps it in as your active ship.
   const storedShips = [];
   // Base value per class; sell = a fraction scaled by condition; buy = full.
-  const SHIP_BASE_VALUE = { sloop: 300, brig: 900, galleon: 2400 };
+  const SHIP_BASE_VALUE = {
+    cutter: 150, sloop: 300, schooner: 550, brig: 900,
+    frigate: 1600, galleon: 2400, manowar: 4200,
+  };
   const shipCondition = (s) => Math.max(0, Math.min(1, s.hp / s.maxHp));
   const sellPrice = (s) => Math.round(SHIP_BASE_VALUE[s.specKey || 'sloop'] * (0.35 + 0.4 * shipCondition(s)));
   const buyPrice  = (key) => SHIP_BASE_VALUE[key];
@@ -363,11 +392,16 @@ async function startGame(seed) {
     newShip.faction = 'player';
     if (newShip.mesh) newShip.mesh.visible = true;
     if (newShip.wheelMesh) newShip.wheelMesh.visible = true;
+    if (newShip.factionFlag) newShip.factionFlag.visible = true;
     // Place her at the cove dock, afloat.
     newShip.dir.copy(cove.dir);
     newShip.position.copy(cove.position);
     newShip.update(0);
     if (!combat.targets.includes(newShip)) combat.targets.push(newShip);
+    // Gold transfers to whatever ship you change to: move the whole purse onto
+    // the new active ship (the old one is left with none).
+    if (cur) cur.gold = 0;
+    newShip.gold = gold;            // gold follows you onto the new hull
     ship = newShip; activeShip = newShip;
     fleet.setPlayerShip(ship); // ship-to-ship collision tracks your new vessel
     flashToast(`You take command of ${newShip.name}.`);
@@ -378,6 +412,7 @@ async function startGame(seed) {
     if (s.mesh) s.mesh.visible = false;
     if (s.chestMesh) s.chestMesh.visible = false;
     if (s.wheelMesh) s.wheelMesh.visible = false;
+    if (s.factionFlag) s.factionFlag.visible = false;
     if (s._towed) { s._towed = false; s._towSettle = 0; const ti = _towed.indexOf(s); if (ti >= 0) _towed.splice(ti, 1); }
     combat.targets = combat.targets.filter(t => t !== s);
     if (fleet.owned) { const oi = fleet.owned.indexOf(s); if (oi >= 0) fleet.owned.splice(oi, 1); }
@@ -385,7 +420,7 @@ async function startGame(seed) {
   }
 
   function renderCove() {
-    coveGoldEl.innerHTML = `Stored: <b>${goldStored}g</b>　·　Carried: <b>${gold}g</b>`;
+    coveGoldEl.innerHTML = `Banked: <b>${goldStored}g</b>　·　Aboard: <b>${gold}g</b>`;
     document.querySelectorAll('.cove-tab').forEach(b =>
       b.classList.toggle('active', b.dataset.tab === _coveTab));
     coveBodyEl.innerHTML = '';
@@ -400,8 +435,9 @@ async function startGame(seed) {
     const empty = (msg) => { const e = document.createElement('div'); e.id = 'cove-empty'; e.textContent = msg; coveBodyEl.appendChild(e); };
 
     if (_coveTab === 'repair') {
-      // Repair the active ship + any docked ship that's damaged.
-      const all = [ship, ...storedShips].filter(shipAfloat);
+      // Repair the active ship + docked ships + any captured/towed prizes nearby.
+      const all = [activeShip || ship, ship, ...storedShips, ...(fleet.owned || [])]
+        .filter((s, i, a) => shipAfloat(s) && a.indexOf(s) === i);
       let any = false;
       for (const s of all) {
         const cost = repairCost(s);
@@ -411,16 +447,18 @@ async function startGame(seed) {
         row(`<span class="name"><b>${s.name}</b> · ${s.spec.name}<br><span class="meta">hull ${pct}% · repair ${cost}g</span></span>`,
           `Repair (${cost}g)`, () => {
             if (!spend(cost)) { flashToast('Not enough gold to repair.'); return; }
-            s.hp = s.maxHp;
-            if (s.recommission) s.recommission(); // un-disable if she was crippled
+            // Replank her: rebuild the pristine hull (restores integrity, masts,
+            // sails, full hp) rather than just topping up an HP number.
+            if (s.repairHull) s.repairHull();
+            else { s.hp = s.maxHp; if (s.recommission) s.recommission(); }
             if (audio.playSell) audio.playSell();
-            flashToast(`${s.name} repaired to full.`);
+            flashToast(`${s.name} replanked — good as new.`);
           }, totalGold() < cost);
       }
       if (!any) empty('All your ships are in fine fettle.');
     } else if (_coveTab === 'store') {
       // Your fleet: the active ship + docked ships. Sail out in any.
-      const active = ship;
+      const active = activeShip || ship;
       const r = document.createElement('div'); r.className = 'cove-row';
       r.innerHTML = `<span class="name"><b>${active.name}</b> · ${active.spec.name} <span class="meta">(at the helm)</span></span>`;
       coveBodyEl.appendChild(r);
@@ -441,14 +479,15 @@ async function startGame(seed) {
             if (s.mesh) scene.remove(s.mesh);
             if (s.chestMesh) scene.remove(s.chestMesh);
             if (s.wheelMesh) scene.remove(s.wheelMesh);
+            if (s.factionFlag) scene.remove(s.factionFlag);
             if (audio.playSell) audio.playSell();
             flashToast(`Sold ${s.name} for ${price} gold.`);
           });
       }
     } else if (_coveTab === 'buy') {
-      for (const key of ['sloop', 'brig', 'galleon']) {
+      for (const key of ['cutter', 'sloop', 'schooner', 'brig', 'frigate', 'galleon', 'manowar']) {
         const spec = SHIP_SPECS[key]; const price = buyPrice(key);
-        row(`<span class="name"><b>${spec.name}</b><br><span class="meta">${spec.hp} hull · ${spec.cannonsPerSide*2} guns · ${price}g</span></span>`,
+        row(`<span class="name"><b>${spec.name}</b><br><span class="meta">${spec.hp} hull · ${(spec.cannonsPerSide + (spec.lowerGunsPerSide||0))*2} guns · ${spec.crew} crew · ${price}g</span></span>`,
           `Buy (${price}g)`, () => {
             if (!spend(price)) { flashToast('Not enough gold.'); return; }
             const bought = new Ship(scene, ocean, key, cove.dir, planet, {
@@ -529,11 +568,8 @@ async function startGame(seed) {
     if (_towed.includes(s)) return;
     // Towed ships shouldn't try to sail; the fleet already furls owned sails.
     s.sailRaised = 0; s.speed = 0; s.reverse = false;
-    s._towed = true;
-    // Suppress her collision briefly while she swings into line behind the tug,
-    // so hitching doesn't shove your ship. updateTow clears it once she's settled
-    // (or after a short timeout), after which collision is live again.
-    s._towSettle = 2.5;
+    s._towed = true;        // towed ships don't collide (they trail the tug)
+    s._towSettle = 2.5;     // brief grace before the spring-follow kicks in fully
     _towed.push(s);
   }
   function dropTow(s) {
@@ -547,23 +583,28 @@ async function startGame(seed) {
   // ships are faction 'player' and live in fleet.owned; we never tow the ship
   // you're currently sailing.
   function toggleTowNearest() {
-    const me = activeShip || ship;
+    const me = activeShip || ship;            // the ship doing the pulling (active)
     const ref = (controlMode === 'foot') ? player.position : me.position;
-    // First: if we're already towing something, the closest towed ship is cut.
+    // Towable = any ship of YOURS that you're NOT currently sailing and NOT
+    // standing on (you can't tow the deck under your own feet). That includes
+    // captured prizes (fleet.owned) AND your old starter ship after you've
+    // switched to a new one.
+    const pool = new Set([...(fleet.owned || [])]);
+    if (ship && ship !== me) pool.add(ship); // your home ship if it's not the active one
     let best = null, bestD = Infinity;
-    const candidates = (fleet.owned || []).filter(s =>
-      s !== me && shipAfloat(s));
-    // Also allow hitching the ship you're literally standing on.
-    if (player.onShip && player.onShip !== me && player.onShip.faction === 'player'
-        && shipAfloat(player.onShip) && !candidates.includes(player.onShip)) {
-      candidates.push(player.onShip);
-    }
-    for (const s of candidates) {
+    for (const s of pool) {
+      if (s === me || s === player.onShip || !shipAfloat(s)) continue;
+      if (s.faction !== 'player') continue;
       const d = s.position.clone().sub(ref).length();
-      // Generous reach so you don't have to be pixel-perfect alongside.
-      if (d < s.spec.length * 0.6 + 30 && d < bestD) { bestD = d; best = s; }
+      if (d < s.spec.length * 0.6 + 35 && d < bestD) { bestD = d; best = s; }
     }
-    if (!best) { flashToast('No captured ship nearby to tow. Capture one first ([C]).'); return; }
+    // If we're standing ON a captured ship and want to tow HER, we must first
+    // step off (you can't tow your own footing). Surface a helpful hint for that.
+    if (!best && player.onShip && player.onShip !== me && player.onShip.faction === 'player') {
+      flashToast('Step off her first (back to your own ship), then [T] to tow her.');
+      return;
+    }
+    if (!best) { flashToast('No ship of yours nearby to tow. Clear a ship\'s crew to take her first.'); return; }
     if (_towed.includes(best)) { dropTow(best); flashToast(`Cut ${best.name} loose.`); }
     else { startTow(best); flashToast(`${best.name} hitched — drag her to your cove.`); }
   }
@@ -754,80 +795,69 @@ async function startGame(seed) {
       if (input.pointerLocked && !paused && !_dead) {
         const onShip = player.onShip;
         const party = onShip ? fleet.partyOf(onShip) : null;
-        if (party) {
-          if (_attackCd > 0) _attackCd -= dt;
-          if (_reloadCd > 0) _reloadCd -= dt;
-          // ---- Cutlass: a fast, WIDE SWEEP that catches every crewman in a ~120°
-          // arc in front of you. Any of them caught MID-SWING is PARRIED (a clash,
-          // their blow cancelled, no damage to you); the rest are cut. So a single
-          // sweep can block multiple incoming blades and wound several foes at once.
-          if (input.consumeClick() && _attackCd <= 0) {
-            _attackCd = 0.28; camera.addShake(0.12); _playerSwing = 1; // faster swings + anim
-            const origin = player.position.clone().addScaledVector(player.up, 0.9); // chest height
-            const dir = camera.getForwardDir().clone();
-            dir.addScaledVector(player.up, -dir.dot(player.up)); // flatten to deck plane
-            if (dir.lengthSq() > 1e-5) dir.normalize();
-            const SWEEP_REACH = 3.0, SWEEP_HALF = Math.PI * 0.5; // ~100° each side feels generous
-            const inArc = party.aliveInArc(origin, dir, SWEEP_REACH, SWEEP_HALF);
-            let parried = 0, struck = 0, anyKill = false;
-            for (const m of inArc) {
-              if (m.isSwinging && m.isSwinging()) {
-                m.parried();          // CLASH — block their blow, no trade
-                parried++;
-              } else {
-                if (m.hurt(24 + Math.random() * 10)) anyKill = true;
-                struck++;
-              }
-            }
-            // Sound: a ringing clash if we parried anyone, else a cutting hit / a
-            // whiff if we caught nothing.
-            if (parried && audio.playClash) audio.playClash(player.position);
-            else if (struck && audio.playHit) audio.playHit(player.position);
-            else if (audio.playClash) audio.playClash(player.position); // swoosh-ish
-            if (anyKill && party.cleared()) flashToast(`${onShip.name}'s deck is yours! Press [C] to take her.`);
+        // Tick weapon cooldowns EVERY frame on foot (NOT gated on there being a
+        // party) — otherwise the cutlass cooldown can get stuck > 0 forever when
+        // no party is present, and the sword silently stops swinging.
+        if (_attackCd > 0) _attackCd -= dt;
+        if (_reloadCd > 0) _reloadCd -= dt;
+        // ---- Cutlass: a fast, WIDE SWEEP that catches every crewman in a ~120°
+        // arc in front of you. Any caught MID-SWING is PARRIED (a clash, no trade);
+        // the rest are cut. Works whether or not crew are present (whiffs on air).
+        if (input.consumeClick() && _attackCd <= 0) {
+          _attackCd = 0.28; camera.addShake(0.12); _playerSwing = 1; // swing anim
+          const origin = player.position.clone().addScaledVector(player.up, 0.9);
+          const dir = camera.getForwardDir().clone();
+          dir.addScaledVector(player.up, -dir.dot(player.up)); // flatten to deck plane
+          if (dir.lengthSq() > 1e-5) dir.normalize();
+          const inArc = party ? party.aliveInArc(origin, dir, 3.0, Math.PI * 0.5) : [];
+          let parried = 0, struck = 0, anyKill = false;
+          for (const m of inArc) {
+            if (m.isSwinging && m.isSwinging()) { m.parried(); parried++; }
+            else { if (m.hurt(24 + Math.random() * 10)) anyKill = true; struck++; }
           }
-          if (input.consumeRightClick() && _reloadCd <= 0) {
-            _reloadCd = 1.6; camera.addShake(0.18);
-            const muzzle = player.position.clone().addScaledVector(player.up, 1.3);
-            const tip = muzzle.clone().addScaledVector(camera.getForwardDir(), 14);
-            if (combat.spawnTracer) combat.spawnTracer(muzzle, tip);
-            if (audio.playMusket) audio.playMusket(player.position);
-            const hit = party.nearestAlive(aim, 16); // pistol range
-            if (hit) {
-              const killed = hit.member.hurt(40 + Math.random() * 20);
-              if (killed && party.cleared()) flashToast(`${onShip.name}'s deck is yours! Press [C] to take her.`);
-            }
+          if (parried && audio.playClash) audio.playClash(player.position);
+          else if (struck && audio.playHit) audio.playHit(player.position);
+          else if (audio.playClash) audio.playClash(player.position); // swoosh
+          if (anyKill && party && party.cleared()) flashToast(`${onShip.name}'s deck is yours! [E] take her helm · [T] tow her.`);
+        }
+        // ---- Pistol: ONE shot, then a LONG reload (powder + ramrod) — in practice
+        // you fire once and switch to the cutlass. ----
+        if (input.consumeRightClick() && _reloadCd <= 0) {
+          _reloadCd = 9.0; camera.addShake(0.18); // long muzzle-loader reload
+          const muzzle = player.position.clone().addScaledVector(player.up, 1.3);
+          const look = camera.getForwardDir().clone();
+          const tip = muzzle.clone().addScaledVector(look, 14);
+          if (combat.spawnTracer) combat.spawnTracer(muzzle, tip);
+          if (audio.playMusket) audio.playMusket(player.position);
+          const aim = player.position.clone().addScaledVector(look, 1.0);
+          const hit = party ? party.nearestAlive(aim, 16) : null;
+          if (hit) {
+            const killed = hit.member.hurt(40 + Math.random() * 20);
+            if (killed && party.cleared()) flashToast(`${onShip.name}'s deck is yours! [E] take her helm · [T] tow her.`);
           }
         }
       }
-      // Boarding actions on the ENEMY deck: F (at chest) plunder, C capture.
+      // Boarding the ENEMY deck: AUTO-CAPTURE once you've cleared her crew, then
+      // [F] to plunder her chest. Capturing does NOT make her your active ship —
+      // she drifts free under your flag; take her helm ([E]) or tow her ([T]).
       if (input.pointerLocked && !paused && enemy && player.onShip === enemy && enemy !== ship && !enemy.sunk) {
+        const party = fleet.partyOf(enemy);
+        if (!enemy.captured && (!party || party.cleared())) {
+          // Deck cleared — she strikes her colours and is yours, and you AUTO-LOOT
+          // her hold (the gold of capturing). Re-crew her if she can still sail.
+          enemy.captured = true;
+          enemy.faction = 'player';
+          if (enemy.recommission) enemy.recommission();
+          const g = (enemy.openChest && !enemy.looted) ? enemy.openChest() : 0;
+          if (g) gold += g;
+          flashToast(`${enemy.name} is yours!` + (g ? ` +${g} gold from her hold.` : '')
+            + ' [E] take her helm · [T] tow her home');
+          if (audio.playSell) audio.playSell();
+        }
+        // [F] still works as a manual plunder fallback (e.g. if she had no crew).
         if (input.consumeKey('KeyF') && enemy.nearChest && enemy.nearChest(player.position)) {
           const g = enemy.openChest();
           if (g) { gold += g; flashToast(`+${g} gold — plundered ${enemy.loot.desc}!`); if (audio.playSell) audio.playSell(); }
-        }
-        if (input.consumeKey('KeyC') && !enemy.captured) {
-          // Capture only once her deck is CLEARED of resisting crew. Civilians
-          // have ~1 weak hand; a navy deck is a real fight.
-          const party = fleet.partyOf(enemy);
-          if (party && !party.cleared()) {
-            flashToast(`Her crew still fights! Cut down all ${party.aliveCount()} defenders first.`);
-          } else {
-            enemy.captured = true;
-            enemy.faction = 'player';
-            // Re-crew the prize: if she still has masts + canvas she can sail
-            // again under your flag (clears the surrendered/disabled lock). A
-            // truly dismasted hull stays a derelict you can only tow/abandon.
-            const sailable = enemy.recommission ? enemy.recommission() : true;
-            const g = enemy.openChest ? enemy.openChest() : 0;
-            if (g) gold += g;
-            // She's yours and drifts free — sail her yourself, or press [T] to
-            // hitch a tow line and drag her home to your cove. (No auto-hitch:
-            // it used to yank your ship around on every capture.)
-            flashToast(`Captured ${enemy.name}! Take her helm, or [T] to tow her home.`
-              + (g ? ` (+${g} gold from her hold.)` : ''));
-            if (audio.playSell) audio.playSell();
-          }
         }
       }
       // [T] on foot: hitch/unhitch the nearest captured ship (you don't have to
@@ -895,11 +925,12 @@ async function startGame(seed) {
           flashToast(`${t.name} is moored at your cove.`);
         }
       }
-      // Arriving banks your carried gold (safe at the cove).
+      // Arriving banks the gold aboard your ship (safe forever at the cove).
       if (!_coveVisited && gold > 0) {
         goldStored += gold;
         flashToast(`Banked ${gold} gold at your cove.`);
         gold = 0;
+        if (activeShip) activeShip.gold = 0;
       }
     } else {
       _coveVisited = false; // left the radius — a future arrival opens the menu again
@@ -913,10 +944,21 @@ async function startGame(seed) {
       closeCoveMenu();
     }
 
-    // Hit pulse decays; death triggers a brief delay then respawn.
+    // Hit pulse decays; death triggers a brief delay then respawn. Press [R] to
+    // skip the wait and respawn immediately (also works to scuttle & restart any
+    // time you're stuck — see below).
     if (_hitPulse > 0) _hitPulse = Math.max(0, _hitPulse - dt * 1.5);
-    if (_dead) { _deathT += dt; if (_deathT > 4.5) respawnPlayer(); }
-    else {
+    if (_dead) {
+      _deathT += dt;
+      // [R] skips the death-sink wait and respawns immediately.
+      if (_deathT > 4.5 || input.consumeKey('KeyR')) respawnPlayer();
+    } else if (input.consumeKey('KeyR')) {
+      // [R] when alive = give up NOW (no waiting): respawn the player immediately.
+      // This only affects YOU — your ship is left afloat and untouched, so you
+      // reappear aboard her with her gold intact (gold lives on the ship, not
+      // your body). It does NOT sink/scuttle the ship.
+      respawnPlayer();
+    } else {
       // ---- Breath / drowning ----
       // Breath only RECOVERS when you're genuinely safe: standing on a ship's
       // deck OR ashore on land. While you're out at sea — whether your head is
@@ -952,6 +994,17 @@ async function startGame(seed) {
       _vignetteEl.style.setProperty('--hv-alpha', alpha.toFixed(3));
     }
     if (_healthValEl) _healthValEl.textContent = Math.ceil(playerHp).toString();
+
+    // Reputation readout (Tab HUD): your standing with each faction.
+    if (_repEl && document.body.classList.contains('hud-on')) {
+      const label = { pirate: 'Pirates', military: 'Navy', merchant: 'Merchants', civilian: 'Civilians' };
+      const parts = [];
+      for (const f of ['pirate', 'military', 'merchant', 'civilian']) {
+        const st = factionStanding(f), r = Math.round(reputation[f]);
+        parts.push(`<span class="${st}">${label[f]} ${r >= 0 ? '+' : ''}${r}</span>`);
+      }
+      _repEl.innerHTML = '⚑ ' + parts.join(' · ');
+    }
 
     // ---- Breath vignette: a blue closing-in tint as air runs low. Only really
     // shows in the last ~20s of breath; pulses + warns near empty. ----
@@ -1038,10 +1091,14 @@ async function startGame(seed) {
     const actionEl = document.getElementById('action-prompt');
     const statusEl = document.getElementById('status-line');
 
-    // Gold line (Tab-gated like the rest of the HUD): carried gold + what's
-    // banked at your cove. No target/enemy readout — kept deliberately minimal.
+    // Keep the active ship's gold purse in sync with the working value, so if
+    // she sinks the gold goes down WITH her (the respawn only adopts an afloat
+    // ship's gold).
+    if (activeShip) activeShip.gold = gold;
+    // Gold line (Tab-gated like the rest of the HUD): gold aboard your ship +
+    // what's banked at your cove. No target/enemy readout — deliberately minimal.
     if (combatEl) {
-      combatEl.innerHTML = `🪙 <b>${gold}g</b> carried　·　🏴‍☠️ <b>${goldStored}g</b> at cove`;
+      combatEl.innerHTML = `🪙 <b>${gold}g</b> aboard　·　🏴‍☠️ <b>${goldStored}g</b> at cove`;
     }
 
     // Action prompt: a single context hint, mutually exclusive. The helm/gun
@@ -1058,12 +1115,14 @@ async function startGame(seed) {
         const crewLeft = party ? party.aliveCount() : 0;
         const parts = [];
         if (crewLeft > 0) {
-          // Crew still defending — fight them first.
+          // Crew still defending — fight them first (she's captured automatically
+          // the moment her deck is cleared).
           parts.push(`⚔ ${crewLeft} defending · [LMB] cutlass sweep (parries!) · [RMB] pistol`);
         } else {
+          if (!enemy.captured) parts.push('Deck cleared — she\'s yours!');
+          else parts.push('[E] take her helm · [T] tow her');
           if (enemy.nearChest && enemy.nearChest(player.position)) parts.push('[F] open the chest');
           else if (enemy.loot && !enemy.looted) parts.push('find her chest →');
-          if (!enemy.captured) parts.push('[C] capture the ship');
         }
         action = parts.join(' · ') || 'Her hold is empty';
       }

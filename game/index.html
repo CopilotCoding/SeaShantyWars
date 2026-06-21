@@ -82,6 +82,8 @@ canvas { display: block; }
   font-size: 15px; letter-spacing: 1px; display: none; }
 #status-line  { bottom: 14px; left: 50%; transform: translateX(-50%); }
 #health-line  { bottom: 46px; left: 50%; transform: translateX(-50%); color: var(--gold-br); }
+#rep-line     { bottom: 78px; left: 50%; transform: translateX(-50%); font-size: 12px; }
+#rep-line .hostile { color: #e07a6a; } #rep-line .allied { color: #7ad08a; } #rep-line .neutral { color: var(--parch-dim); }
 #help-line    { bottom: 14px; left: 14px; font-size: 11px; color: var(--parch-dim); }
 /* Transient plunder/capture message — fades via JS-set opacity. */
 #toast { top: 46%; left: 50%; transform: translateX(-50%); color: var(--gold-br);
@@ -135,9 +137,9 @@ canvas { display: block; }
 /* ---- MINIMAL UI: persistent chrome (title, music toggle, combat/status/help
    readouts) is HIDDEN by default and toggled on with [Tab]. Transient toasts +
    the contextual action prompt (which fades on its own) always show. ---- */
-#combat-line, #status-line, #help-line, #title-tag, #music-row, #health-line { display: none; }
+#combat-line, #status-line, #help-line, #title-tag, #music-row, #health-line, #rep-line { display: none; }
 body.hud-on #combat-line, body.hud-on #status-line, body.hud-on #help-line,
-body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { display: block; }
+body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line, body.hud-on #rep-line { display: block; }
 </style>
 </head>
 <body>
@@ -175,6 +177,7 @@ body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { displ
   <div id="toast" class="hud-chip"></div>
   <div id="status-line" class="hud-chip"></div>
   <div id="health-line" class="hud-chip">❤ Health <b id="health-val">100</b></div>
+  <div id="rep-line" class="hud-chip"></div>
   <div id="help-line" class="hud-chip">WASD move · Space jump/swim · Shift dive · Sail alongside an enemy & walk aboard to plunder · P pause</div>
 </div>
 
