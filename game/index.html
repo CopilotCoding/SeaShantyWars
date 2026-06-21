@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sea Shanty Wars</title>
+<style>
+/* ====== ONE STANDARDIZED PIRATE THEME (parchment + gold + deep sea) ====== */
+:root {
+  --gold:    #e8c97a;
+  --gold-br: #f4dd9a;
+  --bronze:  #b8852f;
+  --parch:   #efe2c4;     /* parchment text */
+  --parch-dim:#c9b89a;    /* muted text */
+  --ink:     #1a120a;
+  --panel-bg: rgba(28, 20, 12, 0.82);   /* dark aged-wood panel */
+  --panel-bd: rgba(184, 133, 47, 0.55); /* bronze border */
+  --sea-deep: #07151f;
+  --shadow:  0 2px 6px rgba(0,0,0,0.7);
+  --font:    'Georgia', 'Times New Roman', serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--sea-deep); overflow: hidden; font-family: var(--font); color: var(--parch); }
+canvas { display: block; }
+
+#underwater-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 9;
+  background: radial-gradient(circle at 50% 45%, rgba(20,90,120,0.25) 0%, rgba(8,40,70,0.75) 100%);
+  opacity: 0; transition: opacity 0.25s; }
+
+/* Health = a red vignette that CLOSES IN as you lose health: at full health
+   it's invisible; the lower your health, the wider/darker the red ring eats in
+   from the screen edges. The gradient stops + opacity are set from JS each frame
+   (--hv-inner = where the clear centre ends, --hv-alpha = ring darkness). A
+   short pulse on taking a hit is layered on top via --hv-alpha. */
+#health-vignette { position: fixed; inset: 0; pointer-events: none; z-index: 11;
+  background: radial-gradient(circle at 50% 50%,
+    rgba(120,0,0,0) var(--hv-inner, 90%),
+    rgba(120,0,0, var(--hv-alpha, 0)) 100%);
+  opacity: 1; transition: background 0.15s linear; }
+#ui-root { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+
+/* Crosshair */
+#crosshair { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 16px; height: 16px; opacity: 0.7; }
+#crosshair::before, #crosshair::after { content: ''; position: absolute; background: rgba(255,245,220,0.85); }
+#crosshair::before { width: 2px; height: 100%; left: 50%; transform: translateX(-50%); }
+#crosshair::after { width: 100%; height: 2px; top: 50%; transform: translateY(-50%); }
+
+/* ---- Reusable HUD chip: every floating HUD readout uses this ---- */
+.hud-chip {
+  position: absolute;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-bd);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  color: var(--parch);
+  text-shadow: var(--shadow);
+  box-shadow: var(--shadow);
+}
+.hud-chip b { color: var(--gold-br); }
+.hud-title { color: var(--gold); letter-spacing: 2px; font-weight: bold; }
+
+/* HUD placement (all share .hud-chip look) */
+#title-tag   { top: 14px; left: 14px; }
+#music-row   { top: 14px; right: 14px; pointer-events: all; cursor: pointer; }
+#music-row label { cursor: pointer; }
+#combat-line  { top: 14px; left: 50%; transform: translateX(-50%); color: var(--gold); }
+/* The single context-action prompt (one [E]/click hint at a time). Hidden when empty. */
+#action-prompt { top: 60%; left: 50%; transform: translateX(-50%); color: var(--gold-br);
+  font-size: 15px; letter-spacing: 1px; display: none; }
+#status-line  { bottom: 14px; left: 50%; transform: translateX(-50%); }
+#health-line  { bottom: 46px; left: 50%; transform: translateX(-50%); color: var(--gold-br); }
+#help-line    { bottom: 14px; left: 14px; font-size: 11px; color: var(--parch-dim); }
+/* Transient plunder/capture message — fades via JS-set opacity. */
+#toast { top: 46%; left: 50%; transform: translateX(-50%); color: var(--gold-br);
+  font-size: 18px; letter-spacing: 1px; opacity: 0; transition: opacity 0.5s;
+  background: rgba(28,20,12,0.92); border-color: var(--gold); }
+
+/* ---- Reusable full-screen overlay panel (menu / loading / pause) ---- */
+.overlay { position: fixed; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; z-index: 1000;
+  background: radial-gradient(circle at 50% 28%, #14303f 0%, var(--sea-deep) 72%); }
+.overlay h1 { font-size: 58px; color: var(--gold); letter-spacing: 6px;
+  text-shadow: 0 0 24px var(--bronze), 0 4px 8px #000; margin-bottom: 8px; }
+.overlay .subtitle { font-size: 15px; color: var(--parch-dim); letter-spacing: 3px; font-style: italic; margin-bottom: 32px; }
+
+.panel { background: var(--panel-bg); border: 1px solid var(--panel-bd);
+  border-radius: 8px; padding: 22px 26px; display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow); }
+.panel label { font-size: 12px; color: var(--gold); letter-spacing: 2px; text-transform: uppercase; }
+.panel input { background: rgba(0,0,0,0.3); border: 1px solid var(--panel-bd); color: var(--parch);
+  padding: 10px 12px; font-family: var(--font); font-size: 14px; border-radius: 4px; }
+.panel h2 { font-size: 18px; color: var(--gold); letter-spacing: 2px; text-align: center; margin-bottom: 4px; }
+
+/* ---- One button style ---- */
+.btn { background: linear-gradient(var(--bronze), #6e4d18); border: 1px solid var(--gold);
+  color: #fff8e8; padding: 11px 14px; font-family: var(--font); font-size: 15px; letter-spacing: 2px;
+  cursor: pointer; border-radius: 5px; text-shadow: 0 1px 2px #000; transition: filter 0.15s; }
+.btn:hover { filter: brightness(1.18); }
+
+#menu-panel { width: 340px; }
+
+/* Loading */
+#loading-screen { display: none; }
+#loading-bar-bg { width: 320px; height: 5px; background: rgba(0,0,0,0.4); border: 1px solid var(--panel-bd); border-radius: 3px; }
+#loading-bar-fill { width: 0%; height: 100%; background: linear-gradient(90deg, var(--bronze), var(--gold)); border-radius: 3px; transition: width 0.25s; }
+#loading-text { margin-top: 14px; font-size: 13px; color: var(--parch-dim); }
+
+/* Pause */
+#pause-menu { display: none; background: rgba(4,10,16,0.74); z-index: 900; pointer-events: all; }
+#pause-menu .panel { min-width: 240px; }
+
+/* ---- MINIMAL UI: persistent chrome (title, music toggle, combat/status/help
+   readouts) is HIDDEN by default and toggled on with [Tab]. Transient toasts +
+   the contextual action prompt (which fades on its own) always show. ---- */
+#combat-line, #status-line, #help-line, #title-tag, #music-row, #health-line { display: none; }
+body.hud-on #combat-line, body.hud-on #status-line, body.hud-on #help-line,
+body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { display: block; }
+</style>
+</head>
+<body>
+<div id="main-menu" class="overlay" style="z-index:1100">
+  <h1>SEA SHANTY WARS</h1>
+  <div class="subtitle">~ Sing · Sail · Sink · Steal ~</div>
+  <div id="menu-panel" class="panel">
+    <label for="seed-input">World Seed (optional)</label>
+    <input id="seed-input" type="text" placeholder="Random / leave blank" maxlength="16">
+    <button id="set-sail-btn" class="btn">⚓ Set Sail</button>
+  </div>
+</div>
+
+<div id="loading-screen" class="overlay">
+  <h1>SEA SHANTY WARS</h1>
+  <div id="loading-bar-bg"><div id="loading-bar-fill"></div></div>
+  <div id="loading-text">Initializing...</div>
+</div>
+
+<div id="underwater-overlay"></div>
+<div id="health-vignette"></div>
+
+<div id="ui-root" style="display:none">
+  <div id="title-tag" class="hud-chip hud-title">⚓ SEA SHANTY WARS</div>
+  <div id="music-row" class="hud-chip"><label><input type="checkbox" id="music-toggle" checked> shanties</label></div>
+  <div id="crosshair"></div>
+  <div id="combat-line" class="hud-chip"></div>
+  <div id="action-prompt" class="hud-chip"></div>
+  <div id="toast" class="hud-chip"></div>
+  <div id="status-line" class="hud-chip"></div>
+  <div id="health-line" class="hud-chip">❤ Health <b id="health-val">100</b></div>
+  <div id="help-line" class="hud-chip">WASD move · Space jump/swim · Shift dive · Sail alongside an enemy & walk aboard to plunder · P pause</div>
+</div>
+
+<div id="pause-menu" class="overlay">
+  <div class="panel">
+    <h2>⚓ Paused</h2>
+    <button class="btn" id="pause-resume-btn">Resume</button>
+  </div>
+</div>
+
+<script>
+  // Clear any stale service worker / caches from sibling projects.
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+    if (window.caches) caches.keys().then(ks => ks.forEach(k => caches.delete(k)));
+  }
+</script>
+<script type="module" src="main.js"></script>
+</body>
+</html>

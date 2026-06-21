@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Voxel Ship Test</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#06121c; overflow:hidden; font-family:monospace; color:#cde; }
+  canvas { display:block; }
+  #info { position:fixed; top:8px; left:8px; font-size:12px; text-shadow:0 1px 2px #000; }
+</style>
+</head>
+<body>
+<div id="info">Voxel ship test — drag to orbit, wheel to zoom</div>
+<script type="module">
+import { createDevice, SceneRenderer, Scene, Fog, PerspectiveCamera,
+  AmbientLight, DirectionalLight, Vec3 } from './engine.js';
+import { Ocean } from './ocean.js';
+import { VoxelShip } from './ship/voxelShip.js';
+import { SEA_LEVEL } from './constants.js';
+
+const canvas = document.createElement('canvas');
+canvas.width = innerWidth; canvas.height = innerHeight;
+document.body.appendChild(canvas);
+
+const device = await createDevice();
+const renderer = new SceneRenderer(device, canvas, { antialias: true });
+const scene = new Scene();
+scene.device = device;
+scene.background.setHex(0x8fc3e8);
+scene.fog = new Fog(0x8fc3e8, 200, 700);
+
+const camera = new PerspectiveCamera(device, {
+  fov: 60*Math.PI/180, aspect: innerWidth/innerHeight, near: 0.2, far: 2000,
+});
+
+// Place the ship near the +Y pole so we can look at it level.
+const dir = new Vec3(0.02, 1, 0.04).normalize();
+const ocean = new Ocean(scene);
+const ship = new VoxelShip(scene, ocean, 'sloop', dir, null, { name:'Test Sloop', sailColor:0xb33b3b, flagColor:0x161616 });
+ship.sunDir = new Vec3(0.4, 0.8, 0.3).normalize();
+ship.ambient = 0.45;
+
+// Orbit camera around the ship.
+let az = 0.6, pol = 1.1, dist = 26;
+let dragging = false, lx=0, ly=0;
+canvas.addEventListener('mousedown', e=>{dragging=true;lx=e.clientX;ly=e.clientY;});
+addEventListener('mouseup', ()=>dragging=false);
+addEventListener('mousemove', e=>{ if(!dragging)return;
+  az -= (e.clientX-lx)*0.008; pol -= (e.clientY-ly)*0.008;
+  pol = Math.max(0.15, Math.min(Math.PI-0.15, pol)); lx=e.clientX; ly=e.clientY; });
+addEventListener('wheel', e=>{ dist *= (1 + Math.sign(e.deltaY)*0.08); dist=Math.max(8,Math.min(120,dist)); }, {passive:true});
+addEventListener('resize', ()=>{ canvas.width=innerWidth; canvas.height=innerHeight;
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  camera.setViewport(0,0,innerWidth,innerHeight); renderer.setSize(innerWidth,innerHeight); });
+
+let frame=0, last=performance.now();
+function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now(); const dt=Math.min((now-last)/1000,0.1); last=now;
+
+  ocean.update(dt, new Vec3(0.4,0.8,0.3).normalize(), null,
+    scene.fog ? {color:scene.fog.color, near:scene.fog.near, far:scene.fog.far} : null);
+  ship.fog = scene.fog ? {color:scene.fog.color, near:scene.fog.near, far:scene.fog.far} : null;
+  ship.update(dt);
+
+  // Camera orbits the ship's world position.
+  const target = ship.position.clone();
+  // Build an up vector = radial; offset eye in a local orbit frame.
+  const up = target.clone().normalize();
+  const fwd = new Vec3(0,0,1).addScaledVector(up,-new Vec3(0,0,1).dot(up)).normalize();
+  const right = new Vec3().crossVectors(up,fwd).normalize();
+  const horiz = right.clone().multiplyScalar(Math.cos(az)).addScaledVector(fwd, Math.sin(az));
+  const eye = target.clone()
+    .addScaledVector(horiz, Math.sin(pol)*dist)
+    .addScaledVector(up, Math.cos(pol)*dist);
+  camera.position = eye;
+  camera.target = target;
+  camera.up = up;
+  camera.update();
+
+  ocean.update(0, new Vec3(0.4,0.8,0.3).normalize(), eye, null);
+  renderer.render(scene, camera, { frame: ++frame });
+}
+loop();
+</script>
+</body>
+</html>
