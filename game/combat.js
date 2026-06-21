@@ -39,7 +39,9 @@ export class Combat {
   _launch(ship, shots, audio) {
     for (const s of shots) {
       this._spawnBall(s.pos, s.dir.clone().multiplyScalar(BALL_SPEED), ship);
-      this._spawnPuff(s.pos, s.dir, 0x553322, 0.5);
+      // Muzzle flash (brief, bright) + a big lingering black-powder smoke bank.
+      this._spawnPuff(s.pos, s.dir, 0xffcf6e, 0.12, { peakOpacity: 0.8, baseScale: 0.7 });
+      this._spawnSmokeCloud(s.pos, s.dir);
     }
     // Cannon report originates at the firing ship — pass its position so the
     // boom is attenuated by distance from the listener (spatial audio).
@@ -56,12 +58,57 @@ export class Combat {
     this.balls.push({ mesh: m, pos: pos.clone(), vel: vel.clone(), life: BALL_LIFE, owner: ownerShip });
   }
 
-  _spawnPuff(pos, dir, color, life) {
+  _spawnPuff(pos, dir, color, life, opts = {}) {
+    // Soft cap: in a big fleet battle the smoke can balloon — retire the oldest
+    // puffs so we never run unbounded.
+    if (this.puffs.length > 320) {
+      const old = this.puffs.shift();
+      if (old && old.mesh) this.scene.remove(old.mesh);
+    }
     const m = new Mesh(this._puffGeo, new BasicMaterial({ color, transparent: true, opacity: 0.7, depthWrite: false }));
     m.position.copy(pos);
     if (dir) m.position.addScaledVector(dir, 0.6);
+    const base = opts.baseScale || 1;
+    m.scale.set(base, base, base);
     this.scene.add(m);
-    this.puffs.push({ mesh: m, life, maxLife: life, grow: 1 + Math.random() });
+    this.puffs.push({
+      mesh: m, life, maxLife: life, grow: 1 + Math.random(),
+      baseScale: base,
+      peakOpacity: opts.peakOpacity ?? 0.7,
+      expand: opts.expand ?? 1.5,        // how much it grows over its life
+      rise: opts.rise ?? 1.5,            // vertical drift speed
+      // A bit of lateral drift so a cloud billows rather than rising in a column.
+      driftV: opts.drift || null,
+    });
+  }
+
+  // A big BLACK-POWDER SMOKE CLOUD off a firing broadside: many overlapping grey
+  // puffs that BALLOON outward and linger for seconds, drifting up and to
+  // leeward — like the great banks of smoke in old naval-battle paintings.
+  _spawnSmokeCloud(pos, dir) {
+    const n = 7 + Math.floor(Math.random() * 4); // 7–10 puffs per gun cluster
+    for (let i = 0; i < n; i++) {
+      // Scatter the puffs around the muzzle, biased outboard along the gun line.
+      const jitter = new Vec3(
+        (Math.random() * 2 - 1) * 1.4,
+        (Math.random() * 2 - 1) * 1.0,
+        (Math.random() * 2 - 1) * 1.4,
+      );
+      const p = pos.clone().addScaledVector(dir, 0.8 + Math.random() * 2.5).add(jitter);
+      // Greys from dark powder-smoke to pale, varied per puff.
+      const g = 0.32 + Math.random() * 0.4;
+      const color = (Math.round(g * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(g * 255);
+      // Lateral drift mostly outboard + a touch random, so the bank rolls away.
+      const drift = dir.clone().multiplyScalar(1.2 + Math.random() * 1.5)
+        .add(new Vec3((Math.random() * 2 - 1) * 0.8, 0, (Math.random() * 2 - 1) * 0.8));
+      this._spawnPuff(p, null, color, 3.5 + Math.random() * 2.5, {
+        baseScale: 2.2 + Math.random() * 2.0,  // big to start
+        peakOpacity: 0.55,
+        expand: 3.5 + Math.random() * 2,        // balloon outward
+        rise: 0.5 + Math.random() * 0.6,        // slow lazy rise
+        drift,
+      });
+    }
   }
 
   // A musket shot's VFX: a bright muzzle flash at `from` and a thin smoke trail
@@ -125,12 +172,15 @@ export class Combat {
     for (let i = this.puffs.length - 1; i >= 0; i--) {
       const p = this.puffs[i];
       p.life -= dt;
-      const f = Math.max(0, p.life / p.maxLife);
-      p.mesh.material.opacity = f * 0.7;
-      const s = (1 + (1 - f) * p.grow * 1.5);
+      const f = Math.max(0, p.life / p.maxLife); // 1 fresh -> 0 gone
+      // Smoke fades IN briefly then OUT, so a big cloud doesn't pop to full alpha.
+      const fadeIn = Math.min(1, (1 - f) * 6);   // ramps up over the first ~1/6
+      p.mesh.material.opacity = f * fadeIn * p.peakOpacity;
+      const s = p.baseScale * (1 + (1 - f) * p.grow * p.expand);
       p.mesh.scale.set(s, s, s);
-      // drift upward (away from planet center)
-      p.mesh.position.addScaledVector(p.mesh.position.clone().normalize(), dt * 1.5);
+      // Drift upward (away from planet center) + optional lateral billow.
+      p.mesh.position.addScaledVector(p.mesh.position.clone().normalize(), dt * p.rise);
+      if (p.driftV) p.mesh.position.addScaledVector(p.driftV, dt);
       if (p.life <= 0) { this.scene.remove(p.mesh); this.puffs.splice(i, 1); }
     }
   }

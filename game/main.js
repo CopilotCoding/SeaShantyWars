@@ -7,9 +7,12 @@ import { Input } from './input.js';
 import { Shanties } from './audio/shanties.js';
 import { setupScene, placeSun } from './sceneSetup.js';
 import { VoxelShip as Ship } from './ship/voxelShip.js';
+import { SHIP_SPECS } from './ship/hull.js';
 import { Combat } from './combat.js';
 import { Fleet } from './fleet.js';
-import { Vec3 } from './engine.js';
+import { Cove } from './cove.js';
+import { buildCrewMesh } from './crew/crewVoxel.js';
+import { Vec3, quatFromBasis } from './engine.js';
 
 // Marching-cubes lookup tables (edgeTable/triTable) load as globals via a
 // classic <script>, the same way PlanetVoxel does. Workers load their own copy
@@ -63,6 +66,13 @@ async function startGame(seed) {
   const ocean = new Ocean(scene);
 
   const player = new Player(scene, planet, ocean);
+  // A visible VOXEL BODY for the player (a pirate with a cutlass), shown while on
+  // foot so you see yourself + your weapon. Hidden at the helm/cannon (you ARE
+  // the ship then). Reuses the crew figure builder for a matching look.
+  const playerBody = buildCrewMesh(scene.device, 'pirate', 'melee');
+  playerBody.visible = false;
+  scene.add(playerBody);
+  let _playerSwing = 0; // cutlass swing anim phase (1 -> 0) for the body
 
   // Spawn the ship in OPEN water (deep sea with deep water all around it, so it's
   // not a landlocked lagoon), then spawn the player on its deck. Starting at sea
@@ -119,6 +129,14 @@ async function startGame(seed) {
   // `enemy` is the nearest enemy each frame (HUD/boarding target).
   let enemy = fleet.nearest() || fleet.ships[0];
 
+  // Your home PIRATE COVE — placed in a sheltered spot near your start. Sail home
+  // to repair / store / sell / buy ships. A sky beacon marks it from afar.
+  const cove = new Cove(scene, planet, ocean, shipDir);
+  // The cove is a SANCTUARY — no enemies spawn within this radius of it.
+  fleet.setSafeZone(cove.position, 130);
+  let _atCove = false;        // true while the cove menu is open
+  let _coveVisited = false;   // latched on arrival; cleared when you leave the radius
+
   setProgress('Hoist the colours!', 1.0);
   await new Promise(r => setTimeout(r, 250));
 
@@ -164,8 +182,12 @@ async function startGame(seed) {
   let activeShip = ship;
   // For fading the helm/gun action hint after a few seconds in that mode.
   let _lastMode = 'foot', _modeShownT = 0;
-  // Plunder: the player's gold (the point of boarding/looting enemy ships).
-  let gold = 0;
+  // Plunder economy: gold you CARRY (on your person — lost if you die at sea,
+  // banked when you reach your cove) vs gold STORED safe at the cove. Spending
+  // at the cove (repair/buy) draws from the combined purse; selling/banking adds
+  // to stored. Carried resets to 0 on death or on docking (it's deposited).
+  let gold = 0;            // carried
+  let goldStored = 0;      // banked at the cove
 
   // ---- Player health (for boarding combat) ----
   // No always-on bar: health is shown as a RED VIGNETTE that closes in (eats
@@ -174,11 +196,20 @@ async function startGame(seed) {
   const PLAYER_MAX_HP = 100;
   let playerHp = PLAYER_MAX_HP;
   let _hitPulse = 0;     // short red spike on taking a hit (decays)
-  let _dead = false, _deathT = 0;
-  let _adriftT = 0; // time spent with no ship afloat (triggers a fresh sloop)
+  let _dead = false, _deathT = 0, _drowned = false;
   let _attackCd = 0, _reloadCd = 0; // cutlass swing / pistol reload cooldowns
+  // ---- Breath / drowning ----
+  // You can only tread water so long before you go under. The breath meter drains
+  // while you're swimming (in the water, not aboard a ship or ashore) and refills
+  // on deck/land. Empty = you drown (death + respawn). Realistic: get to a hull.
+  const SWIM_SECONDS = 120;    // 2 minutes of swimming before drowning
+  let breath = SWIM_SECONDS;
   const _vignetteEl = document.getElementById('health-vignette');
+  const _breathEl = document.getElementById('breath-vignette');
+  const _breathWarnEl = document.getElementById('breath-warn');
   const _healthValEl = document.getElementById('health-val');
+  const _coveArrowEl = document.getElementById('cove-arrow');
+  const _coveDistEl = document.getElementById('cove-dist');
   // Apply damage to the player (called by enemy crew / cannonballs). Handles
   // death + the hit pulse + sound.
   function damagePlayer(n) {
@@ -202,50 +233,370 @@ async function startGame(seed) {
     return null;
   }
 
-  // Build a fresh STARTER sloop at open water and make it the player's new home
-  // ship: registered as a combat target + collision body. Used when the player
-  // dies with no vessel left to their name (a clean restart, not a game over).
+  // An open-water spawn direction that is ALSO clear of every other ship, so a
+  // fresh hull doesn't appear on top of an enemy (and you don't respawn inside
+  // one). Tries open-water picks until one is far from all current ships.
+  function clearShipSpawnDir() {
+    const others = [...fleet.ships, ...fleet.owned].filter(shipAfloat);
+    const SEA_R = SEA_LEVEL;
+    for (let tries = 0; tries < 40; tries++) {
+      const d = findOpenWater(planet);
+      const wp = d.clone().multiplyScalar(SEA_R);
+      let clear = true;
+      for (const s of others) {
+        if (wp.clone().sub(s.position).length() < 40) { clear = false; break; }
+      }
+      if (clear) return d;
+    }
+    return findOpenWater(planet); // give up — at least it's open water
+  }
+
+  // Build a fresh STARTER sloop at open water (clear of other ships) and make it
+  // the player's new home ship: registered as a combat target + collision body.
+  // Used when the player dies with no vessel left to their name (a clean restart).
   function makeStarterShip() {
     // Drop the old husk's mesh if it's still hanging around.
     if (ship && ship.mesh) scene.remove(ship.mesh);
     if (ship && ship.chestMesh) scene.remove(ship.chestMesh);
     combat.targets = combat.targets.filter(t => t !== ship);
 
-    const dir = findOpenWater(planet);
+    // A lost-everything restart launches you from your COVE (a safe harbour),
+    // not random open sea — so you always come back at home base.
+    const dir = cove.dir.clone();
     const fresh = new Ship(scene, ocean, 'sloop', dir, planet, {
       name: 'The Rusty Wench', faction: 'player',
       sailColor: 0xb33b3b, flagColor: 0x161616,
     });
-    fresh.update(0);
+    // Settle the ship: run a few update steps so its transform, buoyancy and
+    // collision body are fully established BEFORE we stand the player on it.
+    for (let i = 0; i < 4; i++) fresh.update(0.016);
     ship = fresh;
     combat.targets.push(ship);
-    // Keep the player's collision list pointed at the current home ship (plus
-    // any captured ships still afloat).
+    fleet.setPlayerShip(ship); // so ship-to-ship collision tracks the new hull
     player.ships = [ship, ...(fleet ? fleet.owned.filter(shipAfloat) : [])];
     return ship;
   }
 
   // Respawn after death. No permadeath: you wash up and try again. If your home
-  // ship still floats (or you hold a captured ship), you're dropped beside her;
-  // if you have NO ship left, a fresh starter sloop is launched for you.
+  // ship still floats (or you hold a captured ship), you're stood back on HER
+  // deck; if you have NO ship left, a fresh starter sloop is launched for you.
   function respawnPlayer() {
-    _dead = false; playerHp = PLAYER_MAX_HP; _hitPulse = 0;
+    _dead = false; _drowned = false; playerHp = PLAYER_MAX_HP; _hitPulse = 0;
+    breath = SWIM_SECONDS; // catch your breath on respawn
     controlMode = 'foot'; mannedCannon = null;
+    if (gold > 0) { flashToast(`You lost ${gold} carried gold when you fell.`); gold = 0; }
 
     let home = pickRespawnShip();
     let freshStart = false;
     if (!home) { home = makeStarterShip(); freshStart = true; }
     ship = home;            // adopt this as the home ship
     activeShip = home;
+    fleet.setPlayerShip(home);
 
-    // Drop in the sea a short way off her beam, then climb aboard.
-    const off = home.right.clone().multiplyScalar(8).addScaledVector(home.up, 1);
-    player.position.copy(home.position).add(off);
-    player.position.setLength(SEA_LEVEL + 0.5);
+    // Stand the player squarely ON HER DECK (toward the bow, off the mast
+    // column) rather than in the water — so collision is solid immediately and
+    // you can never wake up inside an adjacent enemy hull.
+    home.update(0); // ensure transform current
+    player.position.copy(home.localToWorld(
+      new Vec3(0, home.deckLocalY() + 1.0, home.spec.length * 0.2)));
+    player.up.copy(home.up);
+    player.onShip = home;
+    player.ships = [home, ...(fleet ? fleet.owned.filter(shipAfloat) : []),
+      ...fleet.ships].filter((s, i, a) => a.indexOf(s) === i);
     player.velocity.set(0, 0, 0);
     flashToast(freshStart
-      ? 'Your last ship lost — you wash up aboard a fresh sloop. Sail again!'
-      : 'You were cut down — washed back to the surface.');
+      ? 'Your last ship lost — you wake aboard a fresh sloop. Sail again!'
+      : 'You were cut down — you come to on your own deck.');
+  }
+
+  // ============================ PIRATE COVE ECONOMY ========================
+  // Ships you've DOCKED at the cove (stored fleet). Each is a real Ship whose
+  // mesh is hidden while stored; "sail out" swaps it in as your active ship.
+  const storedShips = [];
+  // Base value per class; sell = a fraction scaled by condition; buy = full.
+  const SHIP_BASE_VALUE = { sloop: 300, brig: 900, galleon: 2400 };
+  const shipCondition = (s) => Math.max(0, Math.min(1, s.hp / s.maxHp));
+  const sellPrice = (s) => Math.round(SHIP_BASE_VALUE[s.specKey || 'sloop'] * (0.35 + 0.4 * shipCondition(s)));
+  const buyPrice  = (key) => SHIP_BASE_VALUE[key];
+  // Repair cost = gold per missing hull point, a touch more for bigger hulls.
+  const repairCost = (s) => Math.round((s.maxHp - s.hp) * 1.5);
+  // Spending at the cove draws from STORED first, then carried.
+  const totalGold = () => goldStored + gold;
+  function spend(n) {
+    if (totalGold() < n) return false;
+    const fromStored = Math.min(goldStored, n);
+    goldStored -= fromStored;
+    gold -= (n - fromStored);
+    return true;
+  }
+
+  const coveMenuEl = document.getElementById('cove-menu');
+  const coveBodyEl = document.getElementById('cove-body');
+  const coveGoldEl = document.getElementById('cove-gold');
+  let _coveTab = 'repair';
+
+  function openCoveMenu() {
+    if (coveMenuEl.style.display === 'flex') return;
+    coveMenuEl.style.display = 'flex';
+    if (input.pointerLocked) document.exitPointerLock();
+    flashToast('You sail into your cove.');
+    if (audio.playUi) audio.playUi();
+    renderCove();
+  }
+  function closeCoveMenu() {
+    coveMenuEl.style.display = 'none';
+  }
+
+  // Bring a stored/captured ship into service as your active home ship, and dock
+  // the current one in its place (so you always sail out in exactly one ship).
+  function sailOutIn(newShip) {
+    // Dock the current active ship (hide it, park at cove) unless it's sinking.
+    const cur = ship;
+    if (cur && shipAfloat(cur) && cur !== newShip) {
+      dockShip(cur);
+    }
+    // Un-dock the chosen ship.
+    const di = storedShips.indexOf(newShip);
+    if (di >= 0) storedShips.splice(di, 1);
+    // Remove from fleet.owned if it was a captured prize floating in the world.
+    if (fleet.owned) { const oi = fleet.owned.indexOf(newShip); if (oi >= 0) fleet.owned.splice(oi, 1); }
+    newShip.faction = 'player';
+    if (newShip.mesh) newShip.mesh.visible = true;
+    if (newShip.wheelMesh) newShip.wheelMesh.visible = true;
+    // Place her at the cove dock, afloat.
+    newShip.dir.copy(cove.dir);
+    newShip.position.copy(cove.position);
+    newShip.update(0);
+    if (!combat.targets.includes(newShip)) combat.targets.push(newShip);
+    ship = newShip; activeShip = newShip;
+    fleet.setPlayerShip(ship); // ship-to-ship collision tracks your new vessel
+    flashToast(`You take command of ${newShip.name}.`);
+  }
+
+  // Park a ship at the cove: hide its mesh, remove from world lists, store it.
+  function dockShip(s) {
+    if (s.mesh) s.mesh.visible = false;
+    if (s.chestMesh) s.chestMesh.visible = false;
+    if (s.wheelMesh) s.wheelMesh.visible = false;
+    if (s._towed) { s._towed = false; s._towSettle = 0; const ti = _towed.indexOf(s); if (ti >= 0) _towed.splice(ti, 1); }
+    combat.targets = combat.targets.filter(t => t !== s);
+    if (fleet.owned) { const oi = fleet.owned.indexOf(s); if (oi >= 0) fleet.owned.splice(oi, 1); }
+    if (!storedShips.includes(s)) storedShips.push(s);
+  }
+
+  function renderCove() {
+    coveGoldEl.innerHTML = `Stored: <b>${goldStored}g</b>　·　Carried: <b>${gold}g</b>`;
+    document.querySelectorAll('.cove-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === _coveTab));
+    coveBodyEl.innerHTML = '';
+    const row = (html, btnLabel, onClick, disabled) => {
+      const r = document.createElement('div'); r.className = 'cove-row';
+      r.innerHTML = html;
+      const b = document.createElement('button'); b.className = 'btn'; b.textContent = btnLabel;
+      if (disabled) { b.disabled = true; b.style.opacity = '0.45'; b.style.cursor = 'default'; }
+      else b.onclick = () => { onClick(); renderCove(); };
+      r.appendChild(b); coveBodyEl.appendChild(r);
+    };
+    const empty = (msg) => { const e = document.createElement('div'); e.id = 'cove-empty'; e.textContent = msg; coveBodyEl.appendChild(e); };
+
+    if (_coveTab === 'repair') {
+      // Repair the active ship + any docked ship that's damaged.
+      const all = [ship, ...storedShips].filter(shipAfloat);
+      let any = false;
+      for (const s of all) {
+        const cost = repairCost(s);
+        if (cost <= 0) continue;
+        any = true;
+        const pct = Math.round(shipCondition(s) * 100);
+        row(`<span class="name"><b>${s.name}</b> · ${s.spec.name}<br><span class="meta">hull ${pct}% · repair ${cost}g</span></span>`,
+          `Repair (${cost}g)`, () => {
+            if (!spend(cost)) { flashToast('Not enough gold to repair.'); return; }
+            s.hp = s.maxHp;
+            if (s.recommission) s.recommission(); // un-disable if she was crippled
+            if (audio.playSell) audio.playSell();
+            flashToast(`${s.name} repaired to full.`);
+          }, totalGold() < cost);
+      }
+      if (!any) empty('All your ships are in fine fettle.');
+    } else if (_coveTab === 'store') {
+      // Your fleet: the active ship + docked ships. Sail out in any.
+      const active = ship;
+      const r = document.createElement('div'); r.className = 'cove-row';
+      r.innerHTML = `<span class="name"><b>${active.name}</b> · ${active.spec.name} <span class="meta">(at the helm)</span></span>`;
+      coveBodyEl.appendChild(r);
+      if (!storedShips.length) { empty('No other ships docked. Tow captures home to store them.'); }
+      for (const s of [...storedShips]) {
+        const pct = Math.round(shipCondition(s) * 100);
+        row(`<span class="name"><b>${s.name}</b> · ${s.spec.name}<br><span class="meta">docked · hull ${pct}%</span></span>`,
+          'Sail out', () => sailOutIn(s));
+      }
+    } else if (_coveTab === 'sell') {
+      if (!storedShips.length) { empty('No docked ships to sell. (You can\'t sell the ship you\'re standing on.)'); }
+      for (const s of [...storedShips]) {
+        const price = sellPrice(s);
+        row(`<span class="name"><b>${s.name}</b> · ${s.spec.name}<br><span class="meta">hull ${Math.round(shipCondition(s)*100)}% · sells for ${price}g</span></span>`,
+          `Sell (${price}g)`, () => {
+            goldStored += price; // banked at the cove
+            const i = storedShips.indexOf(s); if (i >= 0) storedShips.splice(i, 1);
+            if (s.mesh) scene.remove(s.mesh);
+            if (s.chestMesh) scene.remove(s.chestMesh);
+            if (s.wheelMesh) scene.remove(s.wheelMesh);
+            if (audio.playSell) audio.playSell();
+            flashToast(`Sold ${s.name} for ${price} gold.`);
+          });
+      }
+    } else if (_coveTab === 'buy') {
+      for (const key of ['sloop', 'brig', 'galleon']) {
+        const spec = SHIP_SPECS[key]; const price = buyPrice(key);
+        row(`<span class="name"><b>${spec.name}</b><br><span class="meta">${spec.hp} hull · ${spec.cannonsPerSide*2} guns · ${price}g</span></span>`,
+          `Buy (${price}g)`, () => {
+            if (!spend(price)) { flashToast('Not enough gold.'); return; }
+            const bought = new Ship(scene, ocean, key, cove.dir, planet, {
+              name: randomShipName(), faction: 'player',
+              sailColor: 0xb33b3b, flagColor: 0x161616,
+            });
+            for (let i = 0; i < 3; i++) bought.update(0.016);
+            dockShip(bought); // parked at the cove, ready to sail out
+            if (audio.playSell) audio.playSell();
+            flashToast(`Bought a ${spec.name}! She's docked — sail out from "Your Fleet".`);
+          }, totalGold() < price);
+      }
+    }
+  }
+
+  // Cove menu wiring (tabs + leave button).
+  document.querySelectorAll('.cove-tab').forEach(b =>
+    b.addEventListener('click', () => { _coveTab = b.dataset.tab; renderCove(); }));
+  document.getElementById('cove-leave-btn').addEventListener('click', () => {
+    // Close the menu and DON'T reopen until you sail out & back (the _coveVisited
+    // latch, set on arrival, stays true until you leave the radius).
+    _atCove = false; closeCoveMenu();
+    if (renderer.domElement && !input.pointerLocked) input.requestPointerLock(renderer.domElement);
+  });
+
+  // Pose + show the player's voxel body (with cutlass). Visible while on FOOT and
+  // at the HELM in third-person; hidden in first-person (it'd fill the screen)
+  // and while manning a gun. Stands at the player's feet, faces the look/heading
+  // direction, and plays the cutlass swing animation.
+  function posePlayerBody(dt) {
+    const up = player.up.clone().normalize();
+    // Facing: at the helm use the ship's bow; on foot use the camera look dir.
+    let fwd;
+    if (controlMode === 'helm' && activeShip) fwd = activeShip.forward.clone();
+    else fwd = camera.getForwardDir().clone();
+    fwd.addScaledVector(up, -fwd.dot(up));            // flatten to the deck plane
+    if (fwd.lengthSq() < 1e-5) fwd = new Vec3(0, 0, 1);
+    fwd.normalize();
+    const right = new Vec3().crossVectors(up, fwd).normalize();
+
+    // Visibility rules.
+    const helmFP = controlMode === 'helm' && (camera._helmDist ?? 1) < 0.18; // zoomed to first person
+    const show = controlMode === 'foot' || (controlMode === 'helm' && !helmFP);
+    playerBody.visible = show;
+    if (!show) return;
+
+    playerBody.position.copy(player.position);
+    const q = quatFromBasis([right.x, right.y, right.z], [up.x, up.y, up.z], [fwd.x, fwd.y, fwd.z]);
+    playerBody.quaternion.set(q[0], q[1], q[2], q[3]);
+
+    // Cutlass swing animation (driven by _playerSwing, set when you attack).
+    const arm = playerBody._swingArm;
+    if (arm) {
+      if (_playerSwing > 0) _playerSwing = Math.max(0, _playerSwing - dt * 7);
+      // Sweep ACROSS the front (yaw the whole arm) for the wide-arc feel.
+      const a = Math.sin((1 - _playerSwing) * Math.PI); // 0..1..0
+      arm.quaternion.setFromAxisAngle(new Vec3(0, 1, 0), -1.2 * _playerSwing + 0.2);
+      void a;
+    }
+  }
+
+  // A throwaway pirate-y name for bought ships.
+  function randomShipName() {
+    const a = ['Black', 'Crimson', 'Salt', 'Gilded', 'Rogue', 'Storm', 'Iron', 'Bonny'];
+    const b = ['Maw', 'Wager', 'Lass', 'Tide', 'Wraith', 'Crown', 'Verse', 'Gale'];
+    return `The ${a[Math.floor(Math.random()*a.length)]} ${b[Math.floor(Math.random()*b.length)]}`;
+  }
+
+  // ============================== TOWING ==================================
+  // Captured prizes trail behind your ship on a tow line so you can drag them
+  // home. Each towed ship is pulled toward a point a fixed distance ASTERN of the
+  // ship ahead of it in the chain (a spring-follow with a hard clamp so it can't
+  // snap/teleport). They keep their AI off (they're in fleet.owned) and just get
+  // positioned here. Reaching the cove auto-docks them.
+  const _towed = []; // captured ships under tow, in chain order (nearest first)
+
+  function startTow(s) {
+    if (_towed.includes(s)) return;
+    // Towed ships shouldn't try to sail; the fleet already furls owned sails.
+    s.sailRaised = 0; s.speed = 0; s.reverse = false;
+    s._towed = true;
+    // Suppress her collision briefly while she swings into line behind the tug,
+    // so hitching doesn't shove your ship. updateTow clears it once she's settled
+    // (or after a short timeout), after which collision is live again.
+    s._towSettle = 2.5;
+    _towed.push(s);
+  }
+  function dropTow(s) {
+    const i = _towed.indexOf(s);
+    if (i >= 0) _towed.splice(i, 1);
+    s._towed = false; s._towSettle = 0;
+  }
+
+  // [T] handler: hitch or cut loose the nearest CAPTURED ship. Works from the
+  // helm or on foot — you just have to be near her (or aboard her). Captured
+  // ships are faction 'player' and live in fleet.owned; we never tow the ship
+  // you're currently sailing.
+  function toggleTowNearest() {
+    const me = activeShip || ship;
+    const ref = (controlMode === 'foot') ? player.position : me.position;
+    // First: if we're already towing something, the closest towed ship is cut.
+    let best = null, bestD = Infinity;
+    const candidates = (fleet.owned || []).filter(s =>
+      s !== me && shipAfloat(s));
+    // Also allow hitching the ship you're literally standing on.
+    if (player.onShip && player.onShip !== me && player.onShip.faction === 'player'
+        && shipAfloat(player.onShip) && !candidates.includes(player.onShip)) {
+      candidates.push(player.onShip);
+    }
+    for (const s of candidates) {
+      const d = s.position.clone().sub(ref).length();
+      // Generous reach so you don't have to be pixel-perfect alongside.
+      if (d < s.spec.length * 0.6 + 30 && d < bestD) { bestD = d; best = s; }
+    }
+    if (!best) { flashToast('No captured ship nearby to tow. Capture one first ([C]).'); return; }
+    if (_towed.includes(best)) { dropTow(best); flashToast(`Cut ${best.name} loose.`); }
+    else { startTow(best); flashToast(`${best.name} hitched — drag her to your cove.`); }
+  }
+
+  function updateTow(dt) {
+    if (!_towed.length) return;
+    let lead = activeShip || ship;     // the ship doing the pulling
+    for (const t of _towed) {
+      if (!shipAfloat(t)) { dropTow(t); continue; }
+      // Target point: astern of `lead` by (half its length + a gap + half tow's).
+      const gap = lead.spec.length * 0.5 + 6 + t.spec.length * 0.5;
+      const astern = lead.forward.clone().multiplyScalar(-1);
+      const target = lead.position.clone().addScaledVector(astern, gap);
+      target.setLength(SEA_LEVEL);     // keep on the sea surface
+      // Spring toward the target, clamped so a fast tug can't teleport the prize.
+      const toTarget = target.clone().sub(t.position);
+      const dist = toTarget.length();
+      const step = Math.min(dist, dist * Math.min(1, dt * 2.5) + lead.speed * dt);
+      if (dist > 1e-3) t.position.addScaledVector(toTarget.multiplyScalar(1 / dist), step);
+      t.position.setLength(SEA_LEVEL);
+      t.dir.copy(t.position).normalize();
+      // Settle window: collision stays off until she's roughly in line behind the
+      // tug (or the timer lapses), then it switches back on.
+      if (t._towSettle > 0) {
+        t._towSettle -= dt;
+        if (dist < t.spec.beam * 1.2) t._towSettle = 0; // arrived in the slot
+      }
+      // Point the prize's bow along the tow direction (toward the lead).
+      const towDir = lead.position.clone().sub(t.position);
+      towDir.addScaledVector(t.dir, -towDir.dot(t.dir)); // project to tangent
+      if (towDir.lengthSq() > 1e-5) t.heading.copy(towDir.normalize());
+      lead = t; // the next ship trails THIS one (a proper chain)
+    }
   }
 
   // A cannonball only hurts someone it DIRECTLY strikes — no big splash. We test
@@ -280,6 +631,8 @@ async function startGame(seed) {
     let dt = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
     if (paused) dt = 0;
+    // Docked at the cove with the menu open: freeze the world (browse in peace).
+    if (_atCove) dt = 0;
 
     camera.decayShake(dt);
 
@@ -375,6 +728,7 @@ async function startGame(seed) {
         if (input.isDown('KeyW') || input.isDown('ArrowUp'))    sailDelta += dt * 0.6;
         if (input.isDown('KeyS') || input.isDown('ArrowDown'))  sailDelta -= dt * 0.6;
         if (input.consumeKey('KeyE')) controlMode = 'foot';
+        if (input.consumeKey('KeyT')) toggleTowNearest(); // hitch/cut the nearest prize
         if (input.consumeClick())      { if (combat.fireBroadside(activeShip,  1, audio)) camera.addShake(0.35); } // LMB = left
         if (input.consumeRightClick()) { if (combat.fireBroadside(activeShip, -1, audio)) camera.addShake(0.35); } // RMB = right
         const scroll = input.consumeScroll();
@@ -403,17 +757,34 @@ async function startGame(seed) {
         if (party) {
           if (_attackCd > 0) _attackCd -= dt;
           if (_reloadCd > 0) _reloadCd -= dt;
-          // Aim point: just in front of the player along the look direction.
-          const aim = player.position.clone().addScaledVector(camera.getForwardDir(), 1.0);
+          // ---- Cutlass: a fast, WIDE SWEEP that catches every crewman in a ~120°
+          // arc in front of you. Any of them caught MID-SWING is PARRIED (a clash,
+          // their blow cancelled, no damage to you); the rest are cut. So a single
+          // sweep can block multiple incoming blades and wound several foes at once.
           if (input.consumeClick() && _attackCd <= 0) {
-            _attackCd = 0.5; camera.addShake(0.12);
-            const hit = party.nearestAlive(aim, 2.6); // cutlass reach
-            if (audio.playClash) audio.playClash(player.position);
-            if (hit) {
-              const killed = hit.member.hurt(26 + Math.random() * 10);
-              if (audio.playHit) audio.playHit(hit.member.position);
-              if (killed && party.cleared()) flashToast(`${onShip.name}'s deck is yours! Press [C] to take her.`);
+            _attackCd = 0.28; camera.addShake(0.12); _playerSwing = 1; // faster swings + anim
+            const origin = player.position.clone().addScaledVector(player.up, 0.9); // chest height
+            const dir = camera.getForwardDir().clone();
+            dir.addScaledVector(player.up, -dir.dot(player.up)); // flatten to deck plane
+            if (dir.lengthSq() > 1e-5) dir.normalize();
+            const SWEEP_REACH = 3.0, SWEEP_HALF = Math.PI * 0.5; // ~100° each side feels generous
+            const inArc = party.aliveInArc(origin, dir, SWEEP_REACH, SWEEP_HALF);
+            let parried = 0, struck = 0, anyKill = false;
+            for (const m of inArc) {
+              if (m.isSwinging && m.isSwinging()) {
+                m.parried();          // CLASH — block their blow, no trade
+                parried++;
+              } else {
+                if (m.hurt(24 + Math.random() * 10)) anyKill = true;
+                struck++;
+              }
             }
+            // Sound: a ringing clash if we parried anyone, else a cutting hit / a
+            // whiff if we caught nothing.
+            if (parried && audio.playClash) audio.playClash(player.position);
+            else if (struck && audio.playHit) audio.playHit(player.position);
+            else if (audio.playClash) audio.playClash(player.position); // swoosh-ish
+            if (anyKill && party.cleared()) flashToast(`${onShip.name}'s deck is yours! Press [C] to take her.`);
           }
           if (input.consumeRightClick() && _reloadCd <= 0) {
             _reloadCd = 1.6; camera.addShake(0.18);
@@ -450,13 +821,18 @@ async function startGame(seed) {
             const sailable = enemy.recommission ? enemy.recommission() : true;
             const g = enemy.openChest ? enemy.openChest() : 0;
             if (g) gold += g;
-            flashToast(`Captured ${enemy.name}!`
-              + (g ? ` +${g} gold from her hold.` : '')
-              + (sailable ? ' Take her helm and sail!' : ' (Dismasted — she\'ll not sail.)'));
+            // She's yours and drifts free — sail her yourself, or press [T] to
+            // hitch a tow line and drag her home to your cove. (No auto-hitch:
+            // it used to yank your ship around on every capture.)
+            flashToast(`Captured ${enemy.name}! Take her helm, or [T] to tow her home.`
+              + (g ? ` (+${g} gold from her hold.)` : ''));
             if (audio.playSell) audio.playSell();
           }
         }
       }
+      // [T] on foot: hitch/unhitch the nearest captured ship (you don't have to
+      // be standing on her — just near her).
+      if (input.pointerLocked && !paused && input.consumeKey('KeyT')) toggleTowNearest();
       ship.setControls({ rudder: 0, sailDelta: 0 });
       runPlayerPhysics = true;
     }
@@ -466,7 +842,16 @@ async function startGame(seed) {
     // it'd be integrated twice and move at double speed.
     const homeInFleet = fleet.owned && fleet.owned.includes(ship);
     if (!homeInFleet) ship.update(dt);
-    if (runPlayerPhysics) {
+    if (_dead && _drowned) {
+      // DROWNING: drag the body under the surface (overrides buoyancy) while the
+      // death delay plays out, then respawn. The screen darkens via the
+      // underwater overlay below. No controls.
+      const downAxis = player.position.clone().normalize();
+      player.position.addScaledVector(downAxis, -2.2 * dt); // sink steadily
+      player.up.copy(downAxis);
+      player.onShip = null; player.grounded = false;
+      camera.update(player.position, player.up, true);
+    } else if (runPlayerPhysics) {
       if (input.pointerLocked && !paused) player.update(dt, input, camera);
       input.consumeClick(); input.consumeRightClick();
       camera.update(player.position, player.up, player.onShip ? false : true);
@@ -482,6 +867,7 @@ async function startGame(seed) {
       camera.update(player.position, player.up, false);
     }
     player.mesh.visible = false;
+    posePlayerBody(dt); // show your voxel pirate body + cutlass
 
     // Enemy ships + projectiles.
     // AI decides controls/firing, THEN the enemy ship integrates them.
@@ -491,18 +877,67 @@ async function startGame(seed) {
     fleet.update(dt, audio, paused, activeShip !== ship ? activeShip : null,
       { player, dealDamage: damagePlayer });
     combat.update(dt);
+    cove.update(dt, now / 1000);
+    updateTow(dt); // drag captured prizes along behind you
+
+    // ---- Cove arrival: when your active ship glides into the cove radius, dock.
+    // Opens the cove menu ONCE. After you cast off it will NOT reopen until you
+    // sail back OUT of the radius and return — `_coveVisited` latches that, fixing
+    // the "menu reopens every second while parked" spam.
+    const coveRef = activeShip || ship;
+    const nearCove = coveRef && cove.playerNear(coveRef.position);
+    if (nearCove) {
+      // Towed prizes that have arrived auto-moor (generous radius so you don't
+      // have to nose right up to the dock).
+      for (const t of [..._towed]) {
+        if (cove.distanceTo(t.position) < cove.dockRadius + 40) {
+          dropTow(t); dockShip(t);
+          flashToast(`${t.name} is moored at your cove.`);
+        }
+      }
+      // Arriving banks your carried gold (safe at the cove).
+      if (!_coveVisited && gold > 0) {
+        goldStored += gold;
+        flashToast(`Banked ${gold} gold at your cove.`);
+        gold = 0;
+      }
+    } else {
+      _coveVisited = false; // left the radius — a future arrival opens the menu again
+    }
+    if (nearCove && !_atCove && !_coveVisited) {
+      _atCove = true;
+      _coveVisited = true; // don't auto-reopen until we leave & come back
+      openCoveMenu();
+    } else if (!nearCove && _atCove) {
+      _atCove = false;
+      closeCoveMenu();
+    }
 
     // Hit pulse decays; death triggers a brief delay then respawn.
     if (_hitPulse > 0) _hitPulse = Math.max(0, _hitPulse - dt * 1.5);
-    if (_dead) { _deathT += dt; if (_deathT > 2.0) respawnPlayer(); }
-    // Stranded safety net: if you're NOT dead but have no vessel left afloat
-    // (your ship sank under you and you hold no captured ship), you're adrift —
-    // give it a moment, then launch a fresh starter sloop so you're never stuck
-    // swimming the open sea forever.
-    else if (!pickRespawnShip()) {
-      _adriftT += dt;
-      if (_adriftT > 4.0) { respawnPlayer(); _adriftT = 0; } // launches a fresh sloop
-    } else { _adriftT = 0; }
+    if (_dead) { _deathT += dt; if (_deathT > 4.5) respawnPlayer(); }
+    else {
+      // ---- Breath / drowning ----
+      // Breath only RECOVERS when you're genuinely safe: standing on a ship's
+      // deck OR ashore on land. While you're out at sea — whether your head is
+      // under, at the surface, or you bobbed/jumped into the AIR over the water —
+      // your breath does NOT refill (it drains in the water, and just HOLDS while
+      // briefly airborne over the sea). This stops you cheesing it by hopping
+      // above the surface for a frame. Reach a hull or shore before it runs out.
+      const safe = player.onShip || (player.grounded && !player.inWater);
+      if (safe) {
+        breath = Math.min(SWIM_SECONDS, breath + dt * 4); // catch your breath
+      } else if (player.inWater) {
+        breath -= dt;                                     // swimming — drains
+        if (breath <= 0) {
+          breath = 0; _drowned = true; playerHp = 0; _dead = true; _deathT = 0;
+          if (audio.playSplash) audio.playSplash(player.position);
+          camera.addShake(0.5);
+          flashToast('You slip beneath the waves — drowned!');
+        }
+      }
+      // (else: airborne over the sea — breath holds, neither drains nor refills)
+    }
     // Drive the red vignette: the less health, the further it closes in (smaller
     // clear centre) and the darker the ring. Dead = full red. A hit pulse adds a
     // momentary darkening on top.
@@ -517,6 +952,47 @@ async function startGame(seed) {
       _vignetteEl.style.setProperty('--hv-alpha', alpha.toFixed(3));
     }
     if (_healthValEl) _healthValEl.textContent = Math.ceil(playerHp).toString();
+
+    // ---- Breath vignette: a blue closing-in tint as air runs low. Only really
+    // shows in the last ~20s of breath; pulses + warns near empty. ----
+    if (_breathEl) {
+      const bfrac = breath / SWIM_SECONDS;               // 1 full .. 0 empty
+      const low = Math.max(0, 1 - bfrac / 0.4);          // 0 until <40% air, ramps to 1 at empty
+      const inner = Math.round(95 - low * 70);           // centre closes in
+      // Pulse faster as it gets desperate.
+      const pulse = low > 0 ? (0.12 * low) * (0.6 + 0.4 * Math.sin(now / 1000 * (4 + low * 8))) : 0;
+      const alpha = Math.min(0.85, low * 0.7 + pulse);
+      _breathEl.style.setProperty('--bv-inner', inner + '%');
+      _breathEl.style.setProperty('--bv-alpha', alpha.toFixed(3));
+      if (_breathWarnEl) _breathWarnEl.style.opacity = (breath < 12 && !_dead) ? '1' : '0';
+    }
+
+    // ---- Cove compass: an arrow that points toward home + the distance, so you
+    // can always steer back. The bearing is the cove direction relative to where
+    // the camera is looking, projected onto the local tangent plane.
+    if (_coveArrowEl && _coveDistEl) {
+      const from = (activeShip || ship).position;
+      const dist = Math.round(cove.distanceTo(from));
+      const up = from.clone().normalize();
+      // Direction to the cove, in the tangent plane at the player.
+      const toCove = cove.position.clone().sub(from);
+      toCove.addScaledVector(up, -toCove.dot(up));
+      // Camera look + right, also tangent-projected.
+      const look = camera.getForwardDir().clone(); look.addScaledVector(up, -look.dot(up));
+      const right = new Vec3().crossVectors(up, look);
+      let glyph = '•';
+      if (toCove.lengthSq() > 1e-4 && look.lengthSq() > 1e-4) {
+        toCove.normalize(); look.normalize(); right.normalize();
+        const ang = Math.atan2(toCove.dot(right), toCove.dot(look)); // 0 = ahead
+        const deg = ang * 180 / Math.PI;
+        glyph = Math.abs(deg) < 22 ? '↑' : Math.abs(deg) > 158 ? '↓'
+          : deg >= 22 && deg < 68 ? '↗' : deg >= 68 && deg < 112 ? '→'
+          : deg >= 112 ? '↘' : deg <= -22 && deg > -68 ? '↖'
+          : deg <= -68 && deg > -112 ? '←' : '↙';
+      }
+      _coveArrowEl.textContent = glyph;
+      _coveDistEl.textContent = dist < cove.dockRadius ? 'home' : `${dist}u`;
+    }
 
 
     // Underwater: tint the screen + tighten fog when the CAMERA EYE is at/below
@@ -536,7 +1012,10 @@ async function startGame(seed) {
     if (uoverlay) {
       // Ramp from 0 at +0.6 above surface to ~0.5 at the surface, then deeper.
       const band = Math.min(1, Math.max(0, (eyeDepth + 0.6) / 0.6)); // 0..1 across the boundary
-      const op = underwater ? Math.min(0.9, 0.5 + eyeDepth * 0.04) : band * 0.5;
+      let op = underwater ? Math.min(0.9, 0.5 + eyeDepth * 0.04) : band * 0.5;
+      // DROWNING: everything goes dark and murky — the overlay deepens toward
+      // near-black as you sink and your vision fades out before respawning.
+      if (_dead && _drowned) op = Math.max(op, Math.min(0.98, 0.55 + _deathT * 0.12));
       uoverlay.style.opacity = op.toString();
     }
 
@@ -559,13 +1038,10 @@ async function startGame(seed) {
     const actionEl = document.getElementById('action-prompt');
     const statusEl = document.getElementById('status-line');
 
-    // Combat line: nearest enemy state + your gold.
+    // Gold line (Tab-gated like the rest of the HUD): carried gold + what's
+    // banked at your cove. No target/enemy readout — kept deliberately minimal.
     if (combatEl) {
-      const enemyTxt = !enemy ? '⚓ open seas'
-        : enemy.captured ? `🏴 ${enemy.name} (yours)`
-        : enemy.surrendered ? `🏳️ ${enemy.name} — surrendered! board her`
-        : `🎯 ${enemy.name} (${enemy.crewType || '?'}) · hull ${Math.round(100 * enemy.hp / enemy.maxHp)}%`;
-      combatEl.innerHTML = `${enemyTxt}　·　<b>🪙 ${gold} gold</b>`;
+      combatEl.innerHTML = `🪙 <b>${gold}g</b> carried　·　🏴‍☠️ <b>${goldStored}g</b> at cove`;
     }
 
     // Action prompt: a single context hint, mutually exclusive. The helm/gun
@@ -583,7 +1059,7 @@ async function startGame(seed) {
         const parts = [];
         if (crewLeft > 0) {
           // Crew still defending — fight them first.
-          parts.push(`⚔ ${crewLeft} crew defending · [LMB] cutlass · [RMB] pistol`);
+          parts.push(`⚔ ${crewLeft} defending · [LMB] cutlass sweep (parries!) · [RMB] pistol`);
         } else {
           if (enemy.nearChest && enemy.nearChest(player.position)) parts.push('[F] open the chest');
           else if (enemy.loot && !enemy.looted) parts.push('find her chest →');
@@ -611,8 +1087,12 @@ async function startGame(seed) {
 
     // Status line: where you are / what you're doing.
     if (statusEl) {
+      // A running bearing/distance to your cove so you can always find home.
+      const coveDist = Math.round(cove.distanceTo((activeShip || ship).position));
+      const coveTag = ` · 🏴‍☠️ cove ${coveDist}u`;
+      const towTag = _towed.length ? ` · towing ${_towed.length} ([T] cut loose)` : '';
       if (controlMode === 'helm' && activeShip) {
-        statusEl.textContent = `⎈ At the helm of ${activeShip.name} · sail ${Math.round(activeShip.sailRaised*100)}% · ${Math.abs(activeShip.speed).toFixed(1)} kn`;
+        statusEl.textContent = `⎈ At the helm of ${activeShip.name} · sail ${Math.round(activeShip.sailRaised*100)}% · ${Math.abs(activeShip.speed).toFixed(1)} kn${towTag}${coveTag}`;
       } else if (controlMode === 'gun' && activeShip) {
         statusEl.textContent = `💥 Manning a cannon aboard ${activeShip.name}`;
       } else if (player.onShip) {

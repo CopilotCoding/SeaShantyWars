@@ -84,6 +84,31 @@ export class Fleet {
     this.parties.set(ship, new CrewParty(this.scene, ship));
   }
 
+  // Point the fleet at the player's CURRENT home ship. Must be called whenever
+  // the home ship is replaced (a fresh starter sloop) or swapped (sailing out a
+  // captured/stored ship), so AI targeting, spawn-distance, and SHIP-TO-SHIP
+  // COLLISION all track the vessel you're actually in — otherwise the new ship
+  // is invisible to the collision resolver (other ships sail right through it).
+  setPlayerShip(s) { if (s) this.playerShip = s; }
+
+  // Mark a world position as a SAFE ZONE (the player's cove): no enemy will spawn
+  // within `radius` of it, so home stays a sanctuary.
+  setSafeZone(worldPos, radius = 120) {
+    this._safeZone = { pos: worldPos.clone(), radius };
+    // Evict any ALREADY-spawned ships sitting inside the new safe zone (the
+    // starting fleet spawns before the cove exists) — relocate them out to a
+    // fresh spawn spot so home starts clear.
+    for (const s of this.ships) {
+      if (this._inSafeZone(s.position)) {
+        const d = this._spawnDir();
+        if (d) { s.dir.copy(d); s.position.copy(d).multiplyScalar(226); s.update(0); }
+      }
+    }
+  }
+  _inSafeZone(wp) {
+    return this._safeZone && wp.clone().sub(this._safeZone.pos).length() < this._safeZone.radius;
+  }
+
   // The crew party defending a given ship (or null).
   partyOf(ship) { return this.parties.get(ship) || null; }
 
@@ -102,25 +127,32 @@ export class Fleet {
   _spawnDir() {
     const base = this.playerShip.position.clone().normalize();
     const SEA_R = 226;
-    // Angular offset from the player -> world distance ≈ angle * SEA_R.
-    // Spawn well away so ships sail INTO view rather than camping the spawn:
-    //   minimum ~90 units, up to ~180. (angle 0.4 rad ≈ 90 units.)
-    const minAng = 0.4, maxAng = 0.8;
+    // Angular offset from the player -> world distance ≈ angle * SEA_R. Spawn
+    // well away in a WIDE ring (angle 0.5..1.3 rad ≈ 110..290u) so a big fleet
+    // has room to spread out and ships sail INTO view rather than on top of you.
+    const MIN_PLAYER_DIST = 110; // hard minimum — NEVER spawn closer than this
+    const minAng = 0.5, maxAng = 1.3;
     const t1 = new Vec3(0,1,0).cross(base); if (t1.lengthSq()<0.01) t1.set(1,0,0); t1.normalize();
     const t2 = new Vec3().crossVectors(base, t1).normalize();
-    for (let tries = 0; tries < 60; tries++) {
-      const a = minAng + Math.random() * (maxAng - minAng);
-      const ang = Math.random() * Math.PI * 2;
-      const d = base.clone().addScaledVector(t1, Math.cos(ang) * a).addScaledVector(t2, Math.sin(ang) * a).normalize();
-      if (!this.isOpenSea(this.planet, d, 8)) continue;
-      const wp = d.clone().multiplyScalar(SEA_R);
-      // Don't spawn near the player OR clustered on another enemy.
-      if (wp.clone().sub(this.playerShip.position).length() < 80) continue;
-      let tooClose = false;
-      for (const s of this.ships) if (s.position.clone().sub(wp).length() < 60) { tooClose = true; break; }
-      if (!tooClose) return d;
+    // Pass 1: ideal spot — far from player, not clustered, not in the cove zone.
+    // Pass 2 (fallback): relax the anti-cluster spacing but KEEP the player
+    // distance + safe-zone rules, so we never spawn a ship in your lap.
+    for (let pass = 0; pass < 2; pass++) {
+      const minSpacing = pass === 0 ? 70 : 24;
+      for (let tries = 0; tries < 120; tries++) {
+        const a = minAng + Math.random() * (maxAng - minAng);
+        const ang = Math.random() * Math.PI * 2;
+        const d = base.clone().addScaledVector(t1, Math.cos(ang) * a).addScaledVector(t2, Math.sin(ang) * a).normalize();
+        if (!this.isOpenSea(this.planet, d, 8)) continue;
+        const wp = d.clone().multiplyScalar(SEA_R);
+        if (this._inSafeZone(wp)) continue;                                   // cove sanctuary
+        if (wp.clone().sub(this.playerShip.position).length() < MIN_PLAYER_DIST) continue; // never near you
+        let tooClose = false;
+        for (const s of this.ships) if (s.position.clone().sub(wp).length() < minSpacing) { tooClose = true; break; }
+        if (!tooClose) return d;
+      }
     }
-    return this.findOpenWater(this.planet);
+    return null; // couldn't place safely this tick — _spawnOne skips it
   }
 
   // The enemy ship nearest the player (for HUD targeting). Null if none.
@@ -178,6 +210,7 @@ export class Fleet {
       if (gone) {
         if (s.sunk && s._removed && s.mesh) this.scene.remove(s.mesh);
         if (s.chestMesh) this.scene.remove(s.chestMesh);
+        if (s.wheelMesh) this.scene.remove(s.wheelMesh);
         this.combat.targets = this.combat.targets.filter(t => t !== s);
         this.ais.delete(s);
         this._disposeParty(s);
@@ -191,6 +224,7 @@ export class Fleet {
       if (s.sunk && s._removed) {
         if (s.mesh) this.scene.remove(s.mesh);
         if (s.chestMesh) this.scene.remove(s.chestMesh);
+        if (s.wheelMesh) this.scene.remove(s.wheelMesh);
         this.combat.targets = this.combat.targets.filter(t => t !== s);
         this.owned.splice(i, 1);
       }
@@ -226,6 +260,11 @@ export class Fleet {
       for (let b = a + 1; b < all.length; b++) {
         const A = all[a], B = all[b];
         if (A.sunk || B.sunk) continue;
+        // A freshly-hitched tow is SETTLING into position behind the tug — its
+        // collision is briefly suppressed (`_towSettle` counts down in main) so
+        // the tow line doesn't shove the ship pulling it. Once settled, collision
+        // is back ON (you can't ram a towed prize through others).
+        if (A._towSettle > 0 || B._towSettle > 0) continue;
         // Each ship's keel segment endpoints (bow & stern) in world space.
         const a0 = A.position.clone().addScaledVector(A.forward,  halfLen(A));
         const a1 = A.position.clone().addScaledVector(A.forward, -halfLen(A));

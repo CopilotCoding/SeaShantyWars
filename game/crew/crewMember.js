@@ -57,6 +57,7 @@ export class CrewMember {
     if (this.ship.sunk || this.ship._sinking) { this.dead = true; this._hide(); return; }
     if (this.hp <= 0) { this.dead = true; this._hide(); return; }
     if (this._attackCd > 0) this._attackCd -= dt;
+    if (this._stagger > 0) this._stagger -= dt; // recovering from a parry
 
     // Resolve a mid-swing melee hit (deferred so the blade visibly connects).
     // Done in-update (not setTimeout) so it can't fire while paused.
@@ -81,8 +82,11 @@ export class CrewMember {
       const dz = pLocal.z - this._localXZ.z;
       const distToPlayer = Math.hypot(dx, dz);
       if (this.kind === 'melee') {
-        // Close to cutlass range, then swing.
-        if (distToPlayer > MELEE_RANGE * 0.7) {
+        // Close to cutlass range, then swing. Staggered (just parried) crew can't
+        // advance or swing for a beat.
+        if (this._stagger > 0) {
+          // hold — recovering
+        } else if (distToPlayer > MELEE_RANGE * 0.7) {
           const inv = MOVE_SPEED * dt / (distToPlayer || 1);
           tx += dx * inv; tz += dz * inv;
         } else if (this._attackCd <= 0) {
@@ -120,10 +124,22 @@ export class CrewMember {
       [r.x, r.y, r.z], [up.x, up.y, up.z], [fwd.x, fwd.y, fwd.z]);
     this.mesh.quaternion.set(q[0], q[1], q[2], q[3]);
 
-    if (this._swing > 0) {
-      this._swing = Math.max(0, this._swing - dt * 5);
-      const a = Math.sin((1 - this._swing) * Math.PI) * 1.4; // swing arc
-      this.mesh._swingArm.quaternion.setFromAxisAngle(new Vec3(1, 0, 0), -a);
+    // Arm pose: during WINDUP (_pendingHit) the blade rises back (telegraph the
+    // incoming blow so the player can read & parry it); then it CHOPS forward as
+    // the swing follows through (_swing decays).
+    const arm = this.mesh._swingArm;
+    if (arm) {
+      let angle = 0;
+      if (this._pendingHit > 0) {
+        // 0.3s windup: arm rotates BACK (positive) to a cocked position.
+        const wind = 1 - Math.max(0, this._pendingHit) / 0.3; // 0 -> 1
+        angle = 0.9 * wind; // raise back up to ~0.9 rad
+      } else if (this._swing > 0) {
+        this._swing = Math.max(0, this._swing - dt * 7);
+        // Chop down through the front (negative).
+        angle = -1.4 * this._swing;
+      }
+      arm.quaternion.setFromAxisAngle(new Vec3(1, 0, 0), angle);
     }
   }
 
@@ -140,9 +156,24 @@ export class CrewMember {
   }
 
   _meleeSwing(player, ctx) {
-    this._attackCd = 1.1;
+    this._attackCd = 0.85;     // faster, more frantic exchanges
     this._swing = 1;
-    this._pendingHit = 0.18; // damage lands ~0.18s into the swing (see update)
+    // A readable WINDUP telegraph: the blade rises for ~0.3s before the blow
+    // lands. This is the window in which the player can PARRY it with a sweep.
+    this._pendingHit = 0.3;
+  }
+
+  // Is this crew member mid-swing with a blow about to land? (Used by the player
+  // to PARRY: a player swing that catches an attacker in this window clashes
+  // instead of trading damage.)
+  isSwinging() { return !this.dead && this._pendingHit > 0; }
+
+  // The player parried/blocked this swing: cancel the pending blow and stagger.
+  parried() {
+    this._pendingHit = 0;
+    this._swing = 0.6;          // recoil pose
+    this._attackCd = Math.max(this._attackCd, 0.6); // knocked off balance
+    this._stagger = 0.35;       // briefly can't advance
   }
 
   // The swing connects: damage the player if still in cutlass range + aboard.
@@ -152,7 +183,7 @@ export class CrewMember {
     const d = Math.hypot(pLocal.x - this._localXZ.x, pLocal.z - this._localXZ.z);
     if (d < MELEE_RANGE && player.onShip === this.ship) {
       ctx.dealDamage(9 + Math.random() * 4, this);
-      if (ctx.audio && ctx.audio.playClash) ctx.audio.playClash(player.position);
+      if (ctx.audio && ctx.audio.playHurt) ctx.audio.playHurt();
     }
   }
 

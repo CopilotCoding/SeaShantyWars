@@ -32,19 +32,28 @@
 // with .ogg/.mp3/.wav. Includes BOTH the short names AND the original long
 // Internet-Archive track filenames, so files work whether or not you renamed
 // them. First found per name wins; multiple per intent = a playlist.
+// The full 1948 Leonard Warren "Sea Shanties" album (RCA Victor MO-1186), all 8
+// tracks. Each entry lists a short name AND the original Internet-Archive track
+// filename, so files work whether or not you renamed them.
 const A = {
   blow:    ['blow-the-man-down', '01 - Blow the Man Down - Leonard Warren - Tom Scott'],
   rio:     ['rio-grande', '02 - Rio Grande - Leonard Warren - Tom Scott - Morris Levine'],
+  drummer: ['drummer-and-cook', '03 - The Drummer and the Cook - Leonard Warren - Tom Scott'],
   shen:    ['shenandoah', '04 - Shenandoah - Leonard Warren - Tom Scott - Morris Levine'],
   haul:    ['haul-away-joe', '05 - Haul-A-Way, Joe - Leonard Warren - Tom Scott'],
+  lowlands:['low-lands', '06 - Low Lands - Leonard Warren - Tom Scott'],
   drunk:   ['drunken-sailor', '07 - The Drunken Sailor - Leonard Warren - Tom Scott'],
   rove:    ["a-roving", "08 - A-Rovin' - Leonard Warren - Tom Scott - Morris Levine"],
 };
 const FILE_MANIFEST = {
-  menu:   ['menu', ...A.shen, ...A.rio],
-  cove:   ['cove', ...A.shen, ...A.rove],
-  sail:   ['sail', ...A.drunk, ...A.haul, ...A.rove, ...A.rio],
-  battle: ['battle', ...A.blow, ...A.drunk],
+  // Every track is listed under 'sail' too, so the whole album cycles while you
+  // sail (the playlist advances song-to-song). Battle/menu/cove pick a fitting
+  // subset. Any extra files you drop in the folder are auto-discovered and added
+  // to 'sail' on top of these (see _discoverFiles).
+  menu:   ['menu', ...A.shen, ...A.rio, ...A.lowlands],
+  cove:   ['cove', ...A.shen, ...A.rove, ...A.drummer],
+  sail:   ['sail', ...A.drunk, ...A.haul, ...A.rove, ...A.rio, ...A.blow, ...A.shen, ...A.drummer, ...A.lowlands],
+  battle: ['battle', ...A.blow, ...A.drunk, ...A.haul, ...A.rio],
 };
 const AUDIO_EXTS = ['mp3', 'ogg', 'wav'];
 const SHANTY_DIR = 'audio/shanties/';
@@ -135,8 +144,59 @@ export class Shanties {
     window.addEventListener('keydown', init, { once: false });
   }
 
+  // Auto-discover ANY audio files sitting in the shanties folder so you can just
+  // drop new public-domain shanties in and they play — no code edit needed. Two
+  // strategies, best-effort:
+  //   1) audio/shanties/manifest.json  — a JSON array of filenames (most robust;
+  //      works on every static server). Generate it however you like.
+  //   2) a directory-index listing — many dev servers (python http.server, Vite
+  //      with a plugin, nginx autoindex) return an HTML listing for the folder;
+  //      we parse <a href> links ending in an audio extension.
+  // Discovered files (minus the ones already in the manifest) get appended to the
+  // 'sail' playlist so they cycle while you sail.
+  async _discoverFiles() {
+    const found = [];
+    // (1) manifest.json
+    try {
+      const res = await fetch(`${SHANTY_DIR}manifest.json`);
+      if (res.ok) {
+        const list = await res.json();
+        if (Array.isArray(list)) for (const f of list) if (typeof f === 'string') found.push(f);
+      }
+    } catch (_) { /* no manifest — fine */ }
+    // (2) directory index HTML
+    if (!found.length) {
+      try {
+        const res = await fetch(SHANTY_DIR);
+        if (res.ok) {
+          const html = await res.text();
+          const re = /href="([^"?]+\.(?:mp3|ogg|wav))"/gi;
+          let m;
+          while ((m = re.exec(html))) found.push(decodeURIComponent(m[1].split('/').pop()));
+        }
+      } catch (_) { /* no listing — fine */ }
+    }
+    if (!found.length) return;
+    // Names already covered by the manifest (any extension stripped).
+    const known = new Set();
+    for (const names of Object.values(FILE_MANIFEST))
+      for (const n of names) known.add(n.toLowerCase());
+    const extra = [];
+    for (const file of found) {
+      const base = file.replace(/\.(mp3|ogg|wav)$/i, '');
+      if (!known.has(base.toLowerCase())) extra.push(base);
+    }
+    if (extra.length) {
+      // Append the new finds to every musical track so they get into rotation,
+      // most visibly while sailing.
+      FILE_MANIFEST.sail.push(...extra);
+      console.log(`[shanties] auto-discovered ${extra.length} extra file(s):`, extra.join(', '));
+    }
+  }
+
   async _loadFiles() {
     this._filesLoading = true; // suppress the synth while recordings decode
+    await this._discoverFiles(); // pick up any files dropped in the folder
     const loadedNames = new Set(); // don't load the same base name twice
     // Load the CURRENTLY-PLAYING track's files FIRST so the real song starts
     // ASAP (no full synth loop first). Order the manifest with current track up top.

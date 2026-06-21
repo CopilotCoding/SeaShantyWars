@@ -37,6 +37,17 @@ canvas { display: block; }
     rgba(120,0,0,0) var(--hv-inner, 90%),
     rgba(120,0,0, var(--hv-alpha, 0)) 100%);
   opacity: 1; transition: background 0.15s linear; }
+/* Breath = a BLUE vignette that closes in as you run low on air while swimming.
+   Same mechanism as health, just a drowning-blue tint on its own layer. */
+#breath-vignette { position: fixed; inset: 0; pointer-events: none; z-index: 11;
+  background: radial-gradient(circle at 50% 50%,
+    rgba(10,40,80,0) var(--bv-inner, 95%),
+    rgba(8,30,70, var(--bv-alpha, 0)) 100%);
+  opacity: 1; transition: background 0.2s linear; }
+#breath-warn { position: fixed; top: 64%; left: 50%; transform: translateX(-50%);
+  z-index: 12; color: #bfe0ff; font-family: var(--font); font-size: 18px;
+  letter-spacing: 1px; text-shadow: 0 2px 6px #000; opacity: 0; pointer-events: none;
+  transition: opacity 0.2s; }
 #ui-root { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
 
 /* Crosshair */
@@ -100,6 +111,17 @@ canvas { display: block; }
 
 #menu-panel { width: 340px; }
 
+/* Cove menu rows: a ship/item line with a label + an action button. */
+.cove-row { display:flex; align-items:center; justify-content:space-between; gap:10px;
+  background: rgba(0,0,0,0.25); border:1px solid var(--panel-bd); border-radius:5px;
+  padding:8px 12px; font-size:13px; }
+.cove-row .meta { color: var(--parch-dim); font-size:11px; }
+.cove-row .name { color: var(--parch); }
+.cove-row .name b { color: var(--gold-br); }
+.cove-row button { padding:6px 12px; font-size:12px; letter-spacing:1px; }
+.cove-tab.active { filter: brightness(1.35); outline:1px solid var(--gold); }
+#cove-empty { color: var(--parch-dim); text-align:center; font-style:italic; padding:20px; }
+
 /* Loading */
 #loading-screen { display: none; }
 #loading-bar-bg { width: 320px; height: 5px; background: rgba(0,0,0,0.4); border: 1px solid var(--panel-bd); border-radius: 3px; }
@@ -137,6 +159,8 @@ body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { displ
 
 <div id="underwater-overlay"></div>
 <div id="health-vignette"></div>
+<div id="breath-vignette"></div>
+<div id="breath-warn">✦ Out of breath — get to a ship!</div>
 
 <div id="ui-root" style="display:none">
   <div id="title-tag" class="hud-chip hud-title">⚓ SEA SHANTY WARS</div>
@@ -144,6 +168,10 @@ body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { displ
   <div id="crosshair"></div>
   <div id="combat-line" class="hud-chip"></div>
   <div id="action-prompt" class="hud-chip"></div>
+  <!-- Always-on cove compass: an arrow + distance pointing home so you can find
+       your cove from anywhere. -->
+  <div id="cove-compass" class="hud-chip" style="top:46px; left:50%; transform:translateX(-50%);
+    color:var(--gold-br); font-size:13px;">🏴‍☠️ <span id="cove-arrow">↑</span> <span id="cove-dist">home</span></div>
   <div id="toast" class="hud-chip"></div>
   <div id="status-line" class="hud-chip"></div>
   <div id="health-line" class="hud-chip">❤ Health <b id="health-val">100</b></div>
@@ -154,6 +182,24 @@ body.hud-on #title-tag, body.hud-on #music-row, body.hud-on #health-line { displ
   <div class="panel">
     <h2>⚓ Paused</h2>
     <button class="btn" id="pause-resume-btn">Resume</button>
+  </div>
+</div>
+
+<!-- PIRATE COVE menu: opens when you sail your ship into the home cove. Repair /
+     store-swap / sell / buy ships. Pure DOM, populated by main.js. -->
+<div id="cove-menu" class="overlay" style="display:none; z-index:950; background:rgba(4,10,16,0.78);">
+  <div class="panel" style="min-width:480px; max-width:560px;">
+    <h2>🏴‍☠️ Smuggler's Cove</h2>
+    <div id="cove-gold" style="text-align:center; color:var(--gold-br); letter-spacing:1px;">Gold: 0</div>
+    <div id="cove-tabs" style="display:flex; gap:8px; justify-content:center; margin:4px 0;">
+      <button class="btn cove-tab" data-tab="repair" style="flex:1;">Repair</button>
+      <button class="btn cove-tab" data-tab="store"  style="flex:1;">Your Fleet</button>
+      <button class="btn cove-tab" data-tab="sell"   style="flex:1;">Sell</button>
+      <button class="btn cove-tab" data-tab="buy"    style="flex:1;">Shipwright</button>
+    </div>
+    <div id="cove-body" style="min-height:180px; max-height:46vh; overflow-y:auto;
+      display:flex; flex-direction:column; gap:8px; padding:4px 2px;"></div>
+    <button class="btn" id="cove-leave-btn">⚓ Cast Off (leave)</button>
   </div>
 </div>
 

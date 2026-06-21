@@ -4,7 +4,7 @@ import {
 import { SEA_LEVEL } from '../constants.js';
 import { sampleOceanHeight } from '../ocean.js';
 import { SHIP_SPECS } from './hull.js';
-import { buildChestMesh, openChestMesh } from '../loot.js';
+import { buildChestMesh, openChestMesh, buildHelmWheel } from '../loot.js';
 
 // FULLY-VOXEL ship. The ship is a 3D grid of cube voxels in SHIP-LOCAL space,
 // transformed as a rigid body (position + quaternion). A cannonball carves a
@@ -380,6 +380,7 @@ export class VoxelShip {
 
     const spec = SHIP_SPECS[specKey] || SHIP_SPECS.sloop;
     this.spec = spec;
+    this.specKey = SHIP_SPECS[specKey] ? specKey : 'sloop'; // class id (cove valuation/repair)
     this.VS = VS;
 
     const layout = buildVoxelLayout(spec);
@@ -470,6 +471,13 @@ export class VoxelShip {
       scene.add(this.chestMesh);
       this.chestOpen = false;
     }
+
+    // ---- Ship's wheel at the helm: a real spinning steering wheel mounted on
+    // the deck. Rides the ship transform each frame; spins with the rudder.
+    this.wheelMesh = buildHelmWheel(scene.device);
+    scene.add(this.wheelMesh);
+    // Mount just forward of the helm stand, standing on the deck.
+    this.wheelLocal = new Vec3(0, this.deckLocalY(), -this.spec.length * 0.30);
   }
 
   _rebuildMesh() {
@@ -975,6 +983,17 @@ export class VoxelShip {
       this.chestMesh.visible = !this._removed;
       this.localToWorld(this.chestLocal, this.chestMesh.position);
       this.chestMesh.quaternion.copy(this.quaternion);
+    }
+    // Ride + spin the ship's wheel: it sits on the deck (ship transform) and the
+    // rim turns with the rudder, so you see the helm respond as you steer.
+    if (this.wheelMesh) {
+      this.wheelMesh.visible = !this._removed;
+      this.localToWorld(this.wheelLocal, this.wheelMesh.position);
+      this.wheelMesh.quaternion.copy(this.quaternion);
+      if (this.wheelMesh._wheel) {
+        this._wheelSpin = (this._wheelSpin || 0) + this.rudder * dt * 3.0;
+        this.wheelMesh._wheel.quaternion.setFromAxisAngle(new Vec3(0, 0, 1), this._wheelSpin);
+      }
     }
   }
 

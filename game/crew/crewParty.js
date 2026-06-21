@@ -55,6 +55,24 @@ export class CrewParty {
     return best ? { member: best, dist: bestD } : null;
   }
 
+  // Every LIVING crew member within `range` of `origin` AND within `halfAngle`
+  // (radians) of the `dir` you're facing — i.e. caught in a forward sword sweep.
+  // `dir` should be a unit vector. Members are measured at chest height so a
+  // ground-tracked foot position still registers. Returns an array of members.
+  aliveInArc(origin, dir, range, halfAngle) {
+    const out = [];
+    const cosHalf = Math.cos(halfAngle);
+    for (const m of this.members) {
+      if (m.dead) continue;
+      const to = m.position.clone().sub(origin);
+      const dist = to.length();
+      if (dist > range || dist < 1e-3) continue;
+      to.multiplyScalar(1 / dist);
+      if (to.dot(dir) >= cosHalf) out.push(m);
+    }
+    return out;
+  }
+
   update(dt, player, ctx) {
     for (const m of this.members) m.update(dt, player, ctx);
   }

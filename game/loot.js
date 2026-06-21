@@ -1,4 +1,48 @@
-import { Mesh, Group, BasicMaterial, LambertMaterial, geometryFromData, boxData, Vec3 } from './engine.js';
+import { Mesh, Group, BasicMaterial, LambertMaterial, geometryFromData, boxData, cylinderData, Vec3 } from './engine.js';
+
+// A ship's STEERING WHEEL: a wooden ring with spokes that stick out past the rim
+// (the classic ship's-wheel handles), mounted on a short binnacle post. Built as
+// a Group so the ship can mount it at the helm and SPIN it with the rudder.
+// `_wheel` is the spinning part (rim+spokes); rotate it about local Z.
+export function buildHelmWheel(device) {
+  const g = new Group();
+  g.frustumCulled = false;
+  // Binnacle post under the wheel.
+  const post = new Mesh(geometryFromData(device, boxData([0.3, 1.1, 0.3])),
+    new LambertMaterial({ color: 0x3a2814 }));
+  post.position.set(0, 0.55, 0);
+  g.add(post);
+  // The spinning wheel sub-group, standing vertical (axis along +Z / fore-aft).
+  const wheel = new Group();
+  wheel.position.set(0, 1.25, 0);
+  const RIM = 0.62;
+  // Rim: a ring approximated by short box segments around a circle.
+  const seg = 12;
+  for (let i = 0; i < seg; i++) {
+    const a = (i / seg) * Math.PI * 2;
+    const bar = new Mesh(geometryFromData(device, boxData([0.16, 0.16, 0.12])),
+      new LambertMaterial({ color: 0x5a3d22 }));
+    bar.position.set(Math.cos(a) * RIM, Math.sin(a) * RIM, 0);
+    bar.quaternion.setFromAxisAngle(new Vec3(0, 0, 1), a);
+    wheel.add(bar);
+  }
+  // Spokes + handles sticking out past the rim.
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    const spoke = new Mesh(geometryFromData(device, boxData([0.1, RIM * 2.2, 0.1])),
+      new LambertMaterial({ color: 0x6b4a2c }));
+    spoke.quaternion.setFromAxisAngle(new Vec3(0, 0, 1), a);
+    wheel.add(spoke);
+  }
+  // Hub.
+  const hub = new Mesh(geometryFromData(device, cylinderData(0.18, 0.18, 0.2, 8)),
+    new LambertMaterial({ color: 0x2a1c0e }));
+  hub.quaternion.setFromAxisAngle(new Vec3(1, 0, 0), Math.PI / 2); // lay flat along Z
+  wheel.add(hub);
+  g.add(wheel);
+  g._wheel = wheel;
+  return g;
+}
 
 // A physical treasure chest that sits on a ship's deck. It's a SEPARATE little
 // mesh (not part of the voxel hull), so it can be opened/emptied cleanly and

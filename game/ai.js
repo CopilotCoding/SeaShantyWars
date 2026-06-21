@@ -39,13 +39,47 @@ export class ShipAI {
     this.combat = combat;
     this.planet = planet;
     this._fireCd = 0;
-    this.engageRange = 75;
-    this.standoff = 34;
+    this.engageRange = 80;
+    this.standoff = 30;        // preferred broadside range (close enough to hit)
+    this.ballSpeed = 60;       // must match Combat.BALL_SPEED for lead prediction
     // Reusable per-frame scratch so we don't churn the GC every tick.
     this._interest = new Float32Array(SLOTS);
     this._danger = new Float32Array(SLOTS);
     // Slowly-varying patrol heading bias so an idle ship wanders smoothly.
     this._wander = Math.random() * Math.PI * 2;
+    // Target velocity estimate (for leading shots): remember its last position.
+    this._lastTargetPos = null;
+    this._targetVel = new Vec3();
+  }
+
+  // Estimate the target's velocity (world units/s) by differencing its position
+  // frame to frame, smoothed. Used to LEAD shots / position the broadside.
+  _estimateTargetVel(target, dt) {
+    if (!this._lastTargetPos || this._lastTarget !== target) {
+      this._lastTargetPos = target.position.clone();
+      this._lastTarget = target;
+      this._targetVel.set(0, 0, 0);
+      return;
+    }
+    if (dt > 1e-4) {
+      const inst = target.position.clone().sub(this._lastTargetPos).multiplyScalar(1 / dt);
+      // Smooth so a single jittery frame doesn't throw the aim off.
+      this._targetVel.lerp ? this._targetVel.lerp(inst, 0.35)
+        : this._targetVel.copy(inst);
+    }
+    this._lastTargetPos.copy(target.position);
+  }
+
+  // Where to aim: the target's predicted position when a shot fired NOW would
+  // arrive (iterate once for a better estimate). Leads moving targets.
+  _leadPoint(target) {
+    const me = this.ship.position;
+    let aim = target.position.clone();
+    for (let i = 0; i < 2; i++) {
+      const t = aim.clone().sub(me).length() / this.ballSpeed;
+      aim = target.position.clone().addScaledVector(this._targetVel, t);
+    }
+    return aim;
   }
 
   // Nearest ship this one is hostile to (and that's alive/afloat).
@@ -155,30 +189,47 @@ export class ShipAI {
     let combatSide = 0;     // which broadside to ready (set when hunting)
 
     if (target) {
-      const toTarget = target.position.clone().sub(ship.position);
-      const dist = toTarget.length();
-      const dirTo = toTarget.addScaledVector(up, -toTarget.dot(up));
+      this._estimateTargetVel(target, dt);
+      // Aim at the LEAD point (where the target will be when a shot lands), so
+      // the ship positions its broadside to hit a moving target, not where it is.
+      const lead = this._leadPoint(target);
+      const toLead = lead.clone().sub(ship.position);
+      const dist = toLead.length();
+      const dirTo = toLead.addScaledVector(up, -toLead.dot(up));
       if (dirTo.lengthSq() > 1e-6) dirTo.normalize();
-      const rightDot = dirTo.dot(right);
+      const rightDot = dirTo.dot(right);   // -1..1: how abeam the lead point is
+      const fwdDot = dirTo.dot(fwd);
 
       if (prey) {
         // FLEE: interest points directly AWAY from the threat.
         this._addInterest(dirTo.clone().multiplyScalar(-1), 3, right, fwd);
         wantSail = 1.0;
-        // Fire only if cornered (threat close & roughly abeam).
-        if (dist < this.standoff * 1.2 && Math.abs(rightDot) > 0.5) combatSide = rightDot >= 0 ? 1 : -1;
-      } else if (dist > this.standoff * 1.25) {
-        // HUNT — approach: interest toward the target.
-        this._addInterest(dirTo, 3, right, fwd);
-        wantSail = 0.75;
+        if (dist < this.standoff * 1.3 && Math.abs(rightDot) > 0.6) combatSide = rightDot >= 0 ? 1 : -1;
+      } else if (dist > this.standoff * 1.4) {
+        // HUNT — CLOSE THE RANGE. Aim slightly off the bow so we arrive at a
+        // broadside angle rather than head-on (an intercept curve).
+        const approach = dirTo.clone().addScaledVector(right, rightDot >= 0 ? -0.35 : 0.35).normalize();
+        this._addInterest(approach, 3, right, fwd);
+        wantSail = 0.85;
+        // Opportunity fire: if a beam lines up while closing AND we're in range.
+        if (dist < this.engageRange && Math.abs(rightDot) > 0.55) combatSide = rightDot >= 0 ? 1 : -1;
       } else {
-        // HUNT — broadside: we want our SIDE facing the target. Bias interest
-        // perpendicular to the bearing (whichever beam is closer) so we orbit
-        // and present guns rather than ram bow-first.
-        const beam = right.clone().multiplyScalar(rightDot >= 0 ? -1 : 1);
-        this._addInterest(beam, 2.5, right, fwd);
-        this._addInterest(dirTo, 0.8, right, fwd); // stay near
-        wantSail = 0.4;
+        // HUNT — HOLD THE BROADSIDE. To put a beam on the target the ship must
+        // steer PERPENDICULAR to the bearing. Context-steering interest is
+        // forward-biased, so a sideways "beam" interest can't turn the ship 90°.
+        // Instead compute the desired HEADING (perpendicular to the bearing) and
+        // bias toward THAT — a real forward direction the ship can turn onto.
+        // Two perpendicular headings exist; pick the one closest to our current
+        // heading so we settle onto a firing line instead of spinning.
+        const perp = new Vec3().crossVectors(up, dirTo).normalize(); // ⟂ to bearing, in plane
+        const desired = perp.dot(fwd) >= 0 ? perp : perp.clone().multiplyScalar(-1);
+        this._addInterest(desired, 4, right, fwd);
+        // Nudge the orbit radius toward standoff so we circle at a good range.
+        if (dist < this.standoff * 0.75) this._addInterest(dirTo.clone().multiplyScalar(-1).normalize(), 1.0, right, fwd);
+        else if (dist > this.standoff * 1.2) this._addInterest(dirTo, 1.0, right, fwd);
+        wantSail = 0.5;
+        // The side the target lies on = which broadside bears. Fire whenever it's
+        // off the beam (not bow/stern), so an orbiting ship cannonades steadily.
         if (Math.abs(rightDot) > 0.45) combatSide = rightDot >= 0 ? 1 : -1;
       }
     } else {
@@ -251,12 +302,14 @@ export class ShipAI {
     const sailDelta = clamp(wantSail - ship.sailRaised, -1, 1) * dt * 0.8;
     ship.setControls({ rudder, sailDelta });
 
-    // --- Fire if a broadside is lined up and in range. ---
+    // --- Fire if a broadside is lined up and in range. Lead is already baked
+    // into combatSide (we only set it when the LEAD point is abeam). ---
     if (combatSide !== 0 && this._fireCd <= 0 && target) {
       const dist = target.position.clone().sub(ship.position).length();
-      const canFire = prey ? dist < this.standoff * 1.2 : dist < this.engageRange;
+      const canFire = prey ? dist < this.standoff * 1.3 : dist < this.engageRange;
       if (canFire && this.combat.fireBroadside(ship, combatSide, audio)) {
-        this._fireCd = prey ? 6 : 4.5;
+        // Faster, more aggressive cannonading; prey fire desperately but rarely.
+        this._fireCd = prey ? 5 : (2.2 + Math.random() * 1.0);
       }
     }
   }
