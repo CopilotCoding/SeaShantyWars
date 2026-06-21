@@ -20,7 +20,7 @@ export class Camera {
     this._lookDir = new Vec3(0, 0, -1);
     this._north   = new Vec3(0, 0, -1);
     this._smoothAltitude = null;
-    this.eyeHeight = 1.55;
+    this.eyeHeight = 1.55; // eye at head height above the player's feet
 
     window.addEventListener('resize', () => {
       this.camera.aspect = window.innerWidth / window.innerHeight;

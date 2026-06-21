@@ -90,11 +90,16 @@ export class Player {
       for (const ship of this.ships) {
         if (ship.atLadder && ship.atLadder(pos)) {
           climbing = true;
-          // Inboard pull (toward the ship center, along -starboard) so cresting
-          // the rail gap drops you onto the deck. Upward velocity is set in the
-          // climbing branch below.
-          pos.addScaledVector(ship.right, -3.0 * dt);
           this.inWater = false;
+          // Climb STRAIGHT UP the webbing first; only pull INBOARD once you've
+          // risen to the rail/deck height so you crest onto the deck. Pulling
+          // inboard while still low shoved you THROUGH the thin hull wall (the
+          // phase-through). The pull is also gentle so collision can keep up.
+          const lp = ship.worldToLocal(pos, new Vec3());
+          const deckY = ship.deckLocalY ? ship.deckLocalY() : 1.5;
+          if (lp.y > deckY - 0.6) {              // near/above the rail top
+            pos.addScaledVector(ship.right, -1.4 * dt);
+          }
           break;
         }
       }
@@ -192,7 +197,10 @@ export class Player {
   //     thin rail between two probes or in one frame.
   _collideShips(dt, up) {
     const RAD = 0.34;
-    const PROBES = [0.1, 0.6, 1.1, 1.6]; // heights along the body
+    // The LOWEST probe sits at hY == RAD so its sphere BOTTOM is exactly at the
+    // feet plane — resting on a deck then lands the feet ON the deck surface
+    // instead of floating ~0.25u above it (which made the eye tower over crew).
+    const PROBES = [RAD, 0.7, 1.2, 1.6]; // heights along the body
     let landedOn = null;
     for (const ship of this.ships) {
       // Quick reject: far from the ship.
@@ -212,7 +220,9 @@ export class Player {
           const pv = ship.platformVelocityAt(this.position, dt, new Vec3());
           this.position.addScaledVector(pv, dt);
           landedOn = ship;
-          if (this._velVert <= 0.01) { this.grounded = true; }
+          if (this._velVert <= 0.01) {
+            this.grounded = true;
+          }
         }
       }
 
@@ -238,6 +248,23 @@ export class Player {
           }
         }
         if (!any) break;
+      }
+
+      // --- Seat the feet ON THE DECK, not on top of the bulwark rail ---
+      // The rail is a 2-cell wall around the deck rim; the penetration probes
+      // would stand you ON TOP of it (~1.2u up), so your eye towered over the
+      // crew. If you're over the deck footprint and at/above deck height, pull
+      // the feet DOWN to the deck surface (along the ship's up, so no sideways
+      // shift), clamped to a small step per frame so it's smooth, never up.
+      if (standing) {
+        const sUp = ship.up;
+        const aboveDeck = this.position.clone().sub(standing).dot(sUp); // >0 = above deck
+        if (aboveDeck > 0.04 && aboveDeck < 1.6 && this._velVert <= 0.01) {
+          const step = Math.min(aboveDeck, Math.max(aboveDeck * Math.min(1, dt * 18), 6 * dt));
+          this.position.addScaledVector(sUp, -step);
+          this.grounded = true;
+          landedOn = ship;
+        }
       }
     }
     this.onShip = landedOn;

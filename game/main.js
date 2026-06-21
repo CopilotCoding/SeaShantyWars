@@ -206,6 +206,7 @@ async function startGame(seed) {
   let _hitPulse = 0;     // short red spike on taking a hit (decays)
   let _dead = false, _deathT = 0, _drowned = false;
   let _attackCd = 0, _reloadCd = 0; // cutlass swing / pistol reload cooldowns
+  let _swallowClickT = 0; // brief window after closing a menu where clicks are eaten
   // ---- Breath / drowning ----
   // You can only tread water so long before you go under. The breath meter drains
   // while you're swimming (in the water, not aboard a ship or ashore) and refills
@@ -435,9 +436,13 @@ async function startGame(seed) {
     const empty = (msg) => { const e = document.createElement('div'); e.id = 'cove-empty'; e.textContent = msg; coveBodyEl.appendChild(e); };
 
     if (_coveTab === 'repair') {
-      // Repair the active ship + docked ships + any captured/towed prizes nearby.
-      const all = [activeShip || ship, ship, ...storedShips, ...(fleet.owned || [])]
-        .filter((s, i, a) => shipAfloat(s) && a.indexOf(s) === i);
+      // Only ships PRESENT AT THE COVE can be repaired: the ship you sailed in
+      // (the active one), docked ships, and any owned/towed prize that's within
+      // the cove radius. Captured ships left out at sea can't be patched up here.
+      const atCove = (s) => storedShips.includes(s) || s === (activeShip || ship)
+        || cove.distanceTo(s.position) < cove.dockRadius + 40;
+      const all = [activeShip || ship, ...storedShips, ...(fleet.owned || [])]
+        .filter((s, i, a) => shipAfloat(s) && a.indexOf(s) === i && atCove(s));
       let any = false;
       for (const s of all) {
         const cost = repairCost(s);
@@ -510,6 +515,10 @@ async function startGame(seed) {
     // Close the menu and DON'T reopen until you sail out & back (the _coveVisited
     // latch, set on arrival, stays true until you leave the radius).
     _atCove = false; closeCoveMenu();
+    // Swallow THIS click (and the next mouse-up) so closing the menu doesn't leak
+    // a pending click that immediately fires a cannon when you re-lock the cursor.
+    input.consumeClick(); input.consumeRightClick();
+    _swallowClickT = 0.25; // ignore clicks for a moment after leaving
     if (renderer.domElement && !input.pointerLocked) input.requestPointerLock(renderer.domElement);
   });
 
@@ -714,6 +723,10 @@ async function startGame(seed) {
     const md = input.consumeMouseDelta();
     if (input.pointerLocked) camera.rotate(md.x, md.y);
 
+    // Eat clicks briefly after closing a menu / re-locking the pointer, so the
+    // re-lock click doesn't leak through and fire a weapon.
+    if (_swallowClickT > 0) { _swallowClickT -= dt; input.consumeClick(); input.consumeRightClick(); }
+
     // Ocean first (so ship buoyancy samples this frame's wave surface), then the
     // ship (so the player can stand on the post-update deck), then the player.
     ocean.update(dt, sunDir, camera.camera.position,
@@ -768,7 +781,21 @@ async function startGame(seed) {
         if (input.isDown('KeyD') || input.isDown('ArrowRight')) rudder += 1;
         if (input.isDown('KeyW') || input.isDown('ArrowUp'))    sailDelta += dt * 0.6;
         if (input.isDown('KeyS') || input.isDown('ArrowDown'))  sailDelta -= dt * 0.6;
-        if (input.consumeKey('KeyE')) controlMode = 'foot';
+        if (input.consumeKey('KeyE')) {
+          controlMode = 'foot';
+          // Step OFF the wheel onto clear deck: place the player a step forward of
+          // the helm and a bit ABOVE the deck so foot physics doesn't resolve them
+          // down through the deck/wheel. (Standing them exactly at the helm voxel
+          // height shoved them into the floor.)
+          const fwd = activeShip.forward.clone();
+          const stand = activeShip.localToWorld(
+            new Vec3(activeShip.spec.beam * 0.18, activeShip.deckLocalY() + 1.1, -activeShip.spec.length * 0.22));
+          player.position.copy(stand);
+          player.up.copy(activeShip.up);
+          player.onShip = activeShip;
+          player.velocity.set(0, 0, 0);
+          void fwd;
+        }
         if (input.consumeKey('KeyT')) toggleTowNearest(); // hitch/cut the nearest prize
         if (input.consumeClick())      { if (combat.fireBroadside(activeShip,  1, audio)) camera.addShake(0.35); } // LMB = left
         if (input.consumeRightClick()) { if (combat.fireBroadside(activeShip, -1, audio)) camera.addShake(0.35); } // RMB = right
@@ -779,7 +806,14 @@ async function startGame(seed) {
     } else if (controlMode === 'gun' && activeShip) {
       // ---- Manning a single cannon: LMB fires THIS gun; E steps off ----
       if (input.pointerLocked && !paused) {
-        if (input.consumeKey('KeyE')) { controlMode = 'foot'; mannedCannon = null; }
+        if (input.consumeKey('KeyE')) {
+          // Step off the gun onto clear deck, lifted a bit so we don't sink in.
+          const stand = activeShip.localToWorld(
+            new Vec3(activeShip.spec.beam * 0.10, activeShip.deckLocalY() + 1.1, mannedCannon ? mannedCannon.z : 0));
+          player.position.copy(stand); player.up.copy(activeShip.up);
+          player.onShip = activeShip; player.velocity.set(0, 0, 0);
+          controlMode = 'foot'; mannedCannon = null;
+        }
         else if (input.consumeClick()) { if (combat.fireCannon(activeShip, mannedCannon, audio)) camera.addShake(0.22); }
       }
       activeShip.setControls({ rudder: 0, sailDelta: 0 });
@@ -886,11 +920,16 @@ async function startGame(seed) {
       input.consumeClick(); input.consumeRightClick();
       camera.update(player.position, player.up, player.onShip ? false : true);
     } else if (controlMode === 'helm' && activeShip) {
+      // If the steered ship is a captured one (updated later by fleet.update, AFTER
+      // this point), integrate it NOW so the helm camera reads its CURRENT position
+      // this frame — otherwise the camera lags a frame behind and micro-jitters.
+      if (fleet.owned && fleet.owned.includes(activeShip)) { activeShip.update(dt); activeShip._steeredThisFrame = true; }
       player.position.copy(activeShip.helmWorld());
       player.up.copy(activeShip.up);
       player.onShip = activeShip;
       camera.updateHelm(activeShip); // third-person view behind the ship
     } else if (controlMode === 'gun' && activeShip && mannedCannon) {
+      if (fleet.owned && fleet.owned.includes(activeShip)) { activeShip.update(dt); activeShip._steeredThisFrame = true; }
       player.position.copy(activeShip.cannonStandWorld(mannedCannon));
       player.up.copy(activeShip.up);
       player.onShip = activeShip;
@@ -904,8 +943,11 @@ async function startGame(seed) {
     // The living sea: AI + ship updates + respawns for the whole fleet.
     // Tell the fleet which captured ship the player is actively steering, so it
     // doesn't force that one's sails down.
-    fleet.update(dt, audio, paused, activeShip !== ship ? activeShip : null,
-      { player, dealDamage: damagePlayer });
+    // Tell the fleet which ship the player is STEERING (the active one whenever
+    // we're at its helm), so it doesn't force that ship's sails down or double-
+    // drive it — which fought the player's helm input and jittered the boat.
+    const steering = (controlMode === 'helm') ? activeShip : null;
+    fleet.update(dt, audio, paused, steering, { player, dealDamage: damagePlayer });
     combat.update(dt);
     cove.update(dt, now / 1000);
     updateTow(dt); // drag captured prizes along behind you

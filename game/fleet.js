@@ -238,6 +238,10 @@ export class Fleet {
     // (`playerSteering`) is left alone (main.js drives its controls); the rest
     // drift dead in the water.
     for (const s of this.owned) {
+      // The ship the player is steering may have ALREADY been integrated this
+      // frame (main.js updates it before the helm camera reads it, to avoid a
+      // 1-frame lag jitter). Don't double-update it.
+      if (s._steeredThisFrame) { s._steeredThisFrame = false; continue; }
       if (s !== playerSteering) s.setControls({ rudder: 0, sailDelta: -1 });
       s.update(dt);
     }
@@ -304,7 +308,13 @@ export class Fleet {
   // along its keel (±~40% length) with radius ≈ half-beam — and resolve the
   // closest points between the two segments. The player ship is included.
   _resolveShipCollisions(dt) {
-    const all = [this.playerShip, ...this.ships, ...this.owned];
+    // DEDUPE: the player's active ship can be both `playerShip` AND in `owned`
+    // (a captured ship you're sailing). Without dedup it appears twice and the
+    // resolver collides it with ITSELF (distance ~0) → a constant shove/jitter.
+    const all = [];
+    for (const s of [this.playerShip, ...this.ships, ...this.owned]) {
+      if (s && !all.includes(s)) all.push(s);
+    }
     const halfLen = (s) => s.spec.length * 0.40;
     const radius  = (s) => s.spec.beam * 0.55;
     for (let a = 0; a < all.length; a++) {
